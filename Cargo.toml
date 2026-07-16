@@ -1,0 +1,52 @@
+[package]
+name = "straight-skeleton"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-2.0-or-later"
+description = "Integer-constrained straight skeleton of polygons with holes, with per-edge distance limits"
+repository = "https://github.com/lizelive/straight-skeleton"
+homepage = "https://github.com/lizelive/straight-skeleton"
+documentation = "https://docs.rs/straight-skeleton"
+readme = "README.md"
+keywords = ["straight-skeleton", "polygon", "offset", "geometry", "roof"]
+categories = ["algorithms", "graphics", "mathematics", "no-std"]
+exclude = ["/.github", "/target"]
+
+[dependencies]
+serde = { version = "1", default-features = false, optional = true, features = ["derive", "alloc"] }
+geo-types = { version = "0.7", default-features = false, optional = true }
+glam = { version = "0.29", default-features = false, optional = true }
+mint = { version = "0.5", optional = true }
+num-traits = { version = "0.2", default-features = false, optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+default = ["std"]
+
+# `std` only reaches into optional dependencies that are actually enabled
+# (the `?` syntax), so turning it off never drags one in.
+std = ["serde?/std", "geo-types?/std", "glam?/std", "num-traits?/std"]
+
+serde = ["dep:serde"]
+geo-types = ["dep:geo-types"]
+# glam needs a maths backend even though this crate only ever uses it for
+# vector conversions. `libm` is the one that works with and without `std`;
+# where `std` is on, the `std` feature above supersedes it.
+glam = ["dep:glam", "glam/libm"]
+mint = ["dep:mint"]
+num-traits = ["dep:num-traits"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
