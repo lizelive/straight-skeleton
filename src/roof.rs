@@ -433,8 +433,8 @@ fn lattice_height(h: f32) -> Option<i16> {
     if !h.is_finite() {
         return None;
     }
-    let r = round_half_away_from_zero(h as f64);
-    if r < i16::MIN as f64 || r > i16::MAX as f64 {
+    let r = round_half_away_from_zero(h);
+    if r < i16::MIN as f32 || r > i16::MAX as f32 {
         return None;
     }
     Some(r as i16)

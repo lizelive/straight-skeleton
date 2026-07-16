@@ -9,84 +9,123 @@ this crate or not.
 
 ## Number types
 
-### The constraint, and where it breaks
+### The rule
 
-The brief asked for `i16` in and out, and for `i32`/`f32` internals so the
-algorithm could be ported to a GPU. The first is met exactly. The second is met
-almost everywhere, and **deliberately broken in two places**. Both are worth
-understanding, because both are forced.
+**`i16` in and out. `i32` and `f32` in between. Nothing wider, anywhere.**
 
-### Predicates are `i64`, and they have to be
+No `f64`, and no `i64` either, in any part of the algorithm. The point is
+portability to hardware where `f64` is slow or missing, and a type you only use
+"internally" is still a type the hardware has to have. The one exception is
+`ring_area2`, which is validation — see below.
 
-An `i16` coordinate spans `-32768..=32767`. A *difference* of two spans
-`-65535..=65535` — **17 bits**. The orientation predicate multiplies two
-differences and subtracts:
+That rule is not free. It is paid for with exactly one bit of coordinate range.
+
+### The cap, and the single expression that sets it
+
+Coordinates are capped at `-16384..=16383` (`Point::MIN_COORD`/`MAX_COORD`),
+one bit narrower than `i16`. `Polygon` rejects anything outside.
+
+Everything traces back to the orientation determinant:
 
 ```
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 ```
 
-Each product reaches `65535^2 ≈ 2^32`, and the difference of two of them needs
-**35 bits**.
+Its width is set by the largest coordinate difference `d`, as `2 * d^2`:
 
-- `i32` holds 31 bits plus sign. It **overflows and wraps**, and a wrapped
-  determinant does not just lose precision — it reports the *wrong side*. There
-  is a test pinning a real triple where `i32` says "left" when the truth is
-  "right": `i32_would_overflow_and_report_the_wrong_side`.
-- `f32` holds 24 mantissa bits, so it rounds each product by up to `2^8 = 256`.
-  Any true determinant below roughly 512 can vanish entirely. There is a test
-  pinning a real triple where `f32` reports "collinear" for a genuine turn:
-  `f32_would_report_a_real_turn_as_collinear`.
+| coordinates | largest `d` | `2 * d^2` | in `i32`? |
+|---|---|---|---|
+| full `i16` | 65_535 | 8_589_672_450 | **overflows** — and wraps to the *wrong side* |
+| capped | 32_767 | 2_147_352_578 | fits, with 131_069 to spare |
 
-`i64` covers 35 bits with room to spare, so every predicate in `predicates` is
-**exact**: no epsilon, no rounding, no overflow, for every `i16` input. Given
-that `correct` is first on the list, this was not a close call.
+So one bit is exactly the price of an **exact** `i32` predicate: no epsilon, no
+rounding, no overflow, for every input `Polygon` accepts. And it is exactly one
+bit — the capped worst case uses 99.994% of `i32`. Two bits would be waste; zero
+bits silently reports the wrong side.
 
-Both tests were written by searching for genuine counterexamples rather than
-asserting a plausible-sounding claim — an earlier draft of this file asserted
-`f32` would round a full-scale determinant to zero, and that turned out to be
-false. The tests now encode what was actually verified.
+### The counterexamples are real, not rhetorical
 
-### The simulation runs in `f64`
+Both failure modes are pinned by tests, against triples found by **search**
+rather than asserted:
 
-Two independent reasons:
+- `beyond_the_cap_i32_would_report_the_wrong_side` — at `(21203,-24650)`,
+  `(-22519,1049)`, `(26449,26335)`, the true determinant is `-2_363_983_124` and
+  `i32` wraps to `+1_930_984_172`. Sign flipped: it reports *left* where the
+  truth is *right*.
+- `f32_would_report_a_real_turn_as_collinear_even_inside_the_cap` — at
+  `(14176,-12146)`, `(-9937,5341)`, `(4434,-5081)`, all **within** the cap, the
+  true determinant is `9` and `f32` returns `0`. A genuine turn, reported as
+  collinear.
 
-1. **Skeleton nodes are irrational.** A 3-4-5 triangle's incenter is rational,
-   but rotate it and it is not. There is no lattice to compute *on*; the output
-   is rounded to `i16` at the boundary and nowhere else.
-2. **`f32` is too coarse across the `i16` range.** At coordinates near 32767,
-   `f32` resolves about `0.004`. Event times are computed from divisions of
-   accumulated quantities, and errors compound across events. The tolerances
-   this crate relies on (`1e-7`, `1e-6`) do not exist in `f32` at that
-   magnitude.
+The second is why the cap does not rescue `f32` for predicates. `f32` has 24
+mantissa bits; these products need up to 31. No range short of absurd fixes
+that, so the predicate is `i32` and the simulation is `f32`, and they are
+different tools for different jobs.
 
-`f64` resolves about `1e-11` there — six orders of margin under the merge
-tolerance and eleven under one lattice unit.
+(An earlier draft of this file asserted that `f32` rounds a full-scale
+determinant to zero. That turned out to be **false** when checked — it returns
+65536 against a true 65535: wrong, but not zero. The tests now encode what was
+actually verified. Search, don't assert.)
 
-### So what about the GPU?
+### The simulation is `f32` — and what that costs
 
-Honest answer: **this crate is not GPU-ready, and would not be even in `f32`.**
-It is a sequential event simulation over a priority queue and a linked structure
-that is rewritten at every event. That is inherently serial; the number types are
-not what stands in the way.
+Skeleton nodes are irrational in general (rotate a 3-4-5 triangle and its
+incenter stops being rational), so there is no lattice to compute *on*. The
+simulation is `f32`, and the cap is what leaves it enough room: `0.002` of
+absolute resolution at the worst corner of the coordinate space, against `0.004`
+uncapped.
 
-What is preserved is the part that transfers: the *public interface* is `i16` and
-`f32` throughout (`Point`, `Node::exact`, `Node::offset`, the per-edge limits),
-so results feed a GPU pipeline without a widening pass. If you want a parallel
-straight skeleton, the literature to start from is motorcycle-graph
-constructions, not this.
+**This is a real robustness trade, and worth being straight about.** `f64` at
+the same coordinates resolves `~1e-11`. Two skeleton features on an integer
+lattice of size `R` can genuinely be `~1/R^2` apart, which at `R = 16384` is
+`~4e-9` — far below what `f32` can see. So:
 
-Calling that out is more useful than quietly shipping an `f32` predicate that is
-wrong on a few thousand inputs per million.
+- For ordinary input, `f32` is fine, and the whole test suite passes at the cap.
+- For adversarially near-degenerate input, `f32` cannot distinguish what `f64`
+  could. The tolerances (`EPS = 1e-4`, `MERGE_EPS = 1e-2`) are set to absorb
+  `f32` noise, and two features closer than `MERGE_EPS` will be fused.
+
+What makes that survivable is that robustness here is mostly *structural*, not
+numeric: needle zipping and node deduplication are what handle degeneracy, and
+both are tolerance-based by design rather than precision-based.
+
+If you need worst-case robustness at full `i16` range, the honest answer is
+double-float arithmetic — a pair of `f32`s giving ~48 mantissa bits, the standard
+technique on hardware without `f64`. That would restore the margin at roughly
+10-20x the arithmetic cost, and it is the obvious next step if the cap ever bites.
+
+### The one exception: `ring_area2`
+
+`ring_area2` keeps an `i64` accumulator. Unlike `orient2d` it *sums* triangles,
+and a ring that doubles back can wind around a region more than once, so the
+running total is bounded by the vertex count rather than the coordinate box. One
+bit of range cannot fix that; only a wider accumulator can.
+
+It is a fair exception because it is **validation**: it runs once, on the host,
+when a `Polygon` is built, and never during the simulation. The skeleton itself
+is `i32` and `f32` throughout.
 
 ### Summary
 
 | Where | Type | Why |
 |---|---|---|
-| Public input and output | `i16` | as specified |
-| `Node::exact`, `Node::offset`, limits | `f32` | narrow, and lossless enough at the boundary |
-| Predicates | `i64` | 35 bits needed; exactness is non-negotiable |
-| Simulation interior | `f64` | nodes are irrational; `f32` is too coarse at scale |
+| Public input and output | `i16`, capped to `±16384` | one bit buys exact `i32` predicates |
+| Predicates | `i32` | exact within the cap; `f32` gets it wrong even inside it |
+| Simulation interior | `f32` | nodes are irrational; the cap leaves enough resolution |
+| `Node::exact`, offsets, limits, roof heights | `f32` | what the simulation actually produced |
+| `ring_area2` only | `i64` | sums can wind; validation-only, never in the simulation |
+
+### So is it GPU-ready?
+
+Honest answer: the *arithmetic* now is — `i32` and `f32` only. The *algorithm*
+is not, and no choice of number type would make it so. It is a sequential event
+simulation over a priority queue and a linked structure rewritten at every event.
+That is inherently serial. A parallel straight skeleton is a motorcycle-graph
+construction, not this.
+
+What the rule buys is real regardless: the whole thing runs on hardware without
+`f64`, results feed a GPU pipeline with no widening pass, and the predicate is
+exact rather than approximately-usually-right.
 
 ## `i16` output, and rounding
 
@@ -235,7 +274,15 @@ a single misplaced node buckles its panel and trips it.
 
 ## What is not here
 
-- **Sub-quadratic algorithms.** Priorities said otherwise. See ALGORITHM.md.
+- **A sub-quadratic worst case.** Measured scaling is ~n^1.3 convex and ~n^1.9
+  to n^2.1 with reflex vertices; the quadratic term is `split_lower_bound`'s scan
+  over every edge. Beating it needs the **motorcycle graph**: reflex vertices
+  launch motorcycles along their bisectors, split events are exactly where they
+  crash, and motorcycle traces are *static rays* — so they can go in a spatial
+  index, which moving wavefront edges cannot. Given the graph, the skeleton
+  follows in `O(n log n)` (Cheng–Vigneron, Huber–Held). It is a different
+  algorithm and a much larger one; CGAL and Surfer2 also ship `O(n^2)` worst
+  cases. See ALGORITHM.md.
 - **Weights other than 0 and 1.** The machinery is general — `velocity_of` solves
   for arbitrary speeds — but arbitrary weights raise degeneracies that are not
   tested, so the API does not expose them.

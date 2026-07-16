@@ -68,8 +68,8 @@ pub struct Node {
     pub position: Point,
     /// The node's unrounded position.
     ///
-    /// Kept as `f32` per the crate's narrow-types preference; the algorithm
-    /// computes in `f64` and narrows here.
+    /// The algorithm computes in `f32` throughout, so this is the value it
+    /// actually arrived at, not a narrowing of something wider.
     pub exact: [f32; 2],
     /// How far the wavefront had travelled when this node was created.
     ///

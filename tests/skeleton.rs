@@ -474,23 +474,57 @@ fn very_thin_sliver_still_terminates() {
     check_invariants(&poly, &skel, TOL);
 }
 
+/// The far corner of the usable coordinate space, where `f32` has the least
+/// absolute resolution (about 0.002) and the arithmetic is under most strain.
 #[test]
-fn coordinates_near_the_i16_limits() {
+fn coordinates_at_the_coordinate_cap() {
+    let (lo, hi) = (Point::MIN_COORD, Point::MAX_COORD);
     let poly = Polygon::from_outer(&[
-        Point::new(-32000, -32000),
-        Point::new(32000, -32000),
-        Point::new(32000, 32000),
-        Point::new(-32000, 32000),
+        Point::new(lo, lo),
+        Point::new(hi, lo),
+        Point::new(hi, hi),
+        Point::new(lo, hi),
     ])
     .unwrap();
     let skel = skeleton(&poly).unwrap();
 
     assert_eq!(skel.node_count(), 5);
     let centre = skel.nodes().iter().find(|n| !n.is_boundary()).unwrap();
-    assert!(centre.position.x.abs() <= 1 && centre.position.y.abs() <= 1);
-    assert!((centre.offset - 32000.0).abs() < 1.0);
-    // A generous tolerance: f32 output resolves ~0.002 at this magnitude.
+    assert!(
+        centre.position.x.abs() <= 1 && centre.position.y.abs() <= 1,
+        "centre landed at {:?}",
+        centre.position
+    );
+    // Half the 32767-wide square.
+    assert!(
+        (centre.offset - 16383.5).abs() < 1.0,
+        "offset {}",
+        centre.offset
+    );
+
+    // A generous tolerance: f32 resolves only ~0.002 out here, which is the
+    // price of the cap and is documented as such.
     check_invariants(&poly, &skel, 0.5);
+}
+
+/// A polygon whose coordinates exceed the cap is rejected rather than computed
+/// with wrapped predicates.
+#[test]
+fn coordinates_beyond_the_cap_are_rejected() {
+    let e = Polygon::from_outer(&[
+        Point::new(-32000, -32000),
+        Point::new(32000, -32000),
+        Point::new(32000, 32000),
+        Point::new(-32000, 32000),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            straight_skeleton::PolygonError::CoordinateOutOfRange { .. }
+        ),
+        "got {e:?}"
+    );
 }
 
 #[test]

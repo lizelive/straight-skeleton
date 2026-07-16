@@ -263,18 +263,20 @@ fn rejects_an_invalid_pitch() {
 /// wrong roof, not an approximate one.
 #[test]
 fn refuses_to_overflow_rather_than_flattening_the_ridge() {
-    let plan = Polygon::from_outer(&rect(30000, 30000)).unwrap();
+    // The widest plan the coordinate cap allows.
+    let plan = Polygon::from_outer(&rect(16000, 16000)).unwrap();
     let skel = skeleton(&plan).unwrap();
 
-    // The apex is 15000 in, so a pitch of 3 wants 45000 — past i16.
+    // The apex is 8000 in, so a pitch of 5 wants 40000 — past i16.
     assert!(matches!(
-        Roof::new(&skel, 3.0),
+        Roof::new(&skel, 5.0),
         Err(RoofError::HeightOverflow { .. })
     ));
 
-    // A pitch that does fit is fine, right up to the boundary.
-    let roof = Roof::new(&skel, 2.0).unwrap();
-    assert_eq!(roof.ridge_height(), 30000);
+    // A pitch that does fit is fine. Heights may exceed the *coordinate* cap,
+    // which only constrains the plan: z is not fed back in as input.
+    let roof = Roof::new(&skel, 4.0).unwrap();
+    assert_eq!(roof.ridge_height(), 32000);
 }
 
 /// A constrained skeleton is truncated into disconnected stubs, so its faces

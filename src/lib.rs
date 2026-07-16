@@ -123,23 +123,36 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! # Coordinates, and where the arithmetic lives
+//! # Coordinates: `i32` and `f32`, and **no `f64`**
 //!
-//! Input and output coordinates are [`Point`]s of `i16`. The crate prefers
-//! narrow types so the algorithm can be ported to a GPU, but two places make a
-//! deliberate, documented exception:
+//! Input and output coordinates are [`Point`]s of `i16`, and the algorithm runs
+//! entirely in `i32` and `f32`. There is no `f64` anywhere in it, and no `i64`
+//! either: the crate is meant to be portable to hardware where `f64` is slow or
+//! missing, and a type you only use "internally" is still a type the hardware
+//! has to have.
 //!
-//! - **Predicates use `i64`** ([`predicates`]). For `i16` inputs the
-//!   orientation determinant needs 35 bits — it does not fit `i32`, and `f32`'s
-//!   24-bit mantissa cannot hold it either. `i64` makes every predicate
-//!   *exact*: no epsilons, no rounding, no overflow.
-//! - **The simulation runs in `f64`.** Skeleton nodes are irrational in
-//!   general, so they cannot be computed on the lattice, and `f32` loses too
-//!   much precision across the full `i16` range.
+//! That costs **one bit of coordinate range**. Coordinates are capped at
+//! [`Point::MIN_COORD`]`..=`[`Point::MAX_COORD`], i.e. `-16384..=16383`, and
+//! [`Polygon`] rejects anything outside it. One expression sets that cap — the
+//! orientation determinant, which needs `2 * d^2` for a largest coordinate
+//! difference `d`:
 //!
-//! Node positions are rounded to the lattice at the boundary; [`Node::exact`]
-//! keeps the unrounded value as `f32`. `docs/DESIGN.md` works through the
-//! width analysis.
+//! | coordinates | `2 * d^2` | in `i32`? |
+//! |---|---|---|
+//! | full `i16` | 8_589_672_450 | **overflows**, reporting the *wrong side* |
+//! | capped | 2_147_352_578 | fits, with 131_069 to spare |
+//!
+//! So one bit buys **exact** predicates ([`predicates`]): no epsilon, no
+//! rounding, no overflow. `f32` cannot do that job at any range — the tests pin
+//! down a real triple *inside* the cap where it reports a genuine turn as
+//! collinear.
+//!
+//! The simulation itself is `f32`. Skeleton nodes are irrational in general, so
+//! there is no lattice to compute on; positions are rounded back to it at the
+//! boundary, and [`Node::exact`] keeps the unrounded value. The cap is also
+//! what leaves `f32` enough absolute resolution — about `0.002` at its worst —
+//! to work in. `docs/DESIGN.md` works through the analysis, including what it
+//! costs in robustness.
 //!
 //! # Feature flags
 //!
@@ -212,11 +225,23 @@ pub use wavefront::SkeletonError;
 ///
 /// # Complexity
 ///
-/// `O(n^2 log n)` time and `O(n)` space, for `n` input vertices. The quadratic
-/// term is the split-event search, which tests each reflex vertex against every
-/// wavefront edge. Sub-quadratic algorithms exist; this crate ranks correctness
-/// and clarity above speed, and the straightforward search is much easier to
-/// verify. Convex polygons have no reflex vertices and so run in `O(n log n)`.
+/// `O(n)` space. For time, measured growth (`cargo run --release --example
+/// bench`) rather than a claim:
+///
+/// | input | 1024 vertices | scaling |
+/// |---|---|---|
+/// | convex | 1.1 ms | ~n^1.3 |
+/// | comb, 512 reflex | 8.9 ms | ~n^1.9 |
+/// | random star, 512 reflex | 13 ms | ~n^2.1 |
+///
+/// **Convex input is sub-quadratic**: with no reflex vertices there is no split
+/// search at all. Otherwise the search is `O(n)` per reflex vertex, so `O(n^2)`
+/// overall. The event count itself is linear.
+///
+/// Beating `O(n^2)` in the worst case needs the motorcycle-graph construction of
+/// Eppstein–Erickson or Cheng–Vigneron — a different and much larger algorithm;
+/// practical implementations (CGAL, Surfer2) also ship an `O(n^2)` worst case.
+/// See `docs/ALGORITHM.md`.
 ///
 /// # Examples
 ///

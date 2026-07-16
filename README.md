@@ -6,7 +6,8 @@
 [![licence](https://img.shields.io/crates/l/straight-skeleton.svg)](LICENSE)
 
 The **straight skeleton** of a polygon, with holes, on the `i16` integer
-lattice. No required dependencies. `no_std`. No `unsafe`.
+lattice. Computed entirely in `i32` and `f32` — **no `f64`, no `i64`**. No
+required dependencies. `no_std`. No `unsafe`.
 
 Shrink a polygon by sliding every edge inward at the same speed, keeping the
 edges straight. The corners trace out a tree of straight segments — that is the
@@ -122,22 +123,33 @@ so the provenance is visible. `roof` uses the library's `Roof` type and only
 adds the OBJ serialisation, since choosing a file format is the caller's
 business rather than the crate's.
 
-## Coordinates
+## Coordinates: `i32` and `f32`, no `f64`
 
-`i16` in and out, on the lattice. Two places deliberately use wider arithmetic,
-and both are forced:
+`i16` in and out. Everything in between is `i32` and `f32` — nothing wider, so
+the arithmetic ports to hardware where `f64` is slow or absent.
 
-- **Predicates are `i64`.** For `i16` inputs the orientation determinant needs
-  **35 bits**. `i32` overflows and reports the *wrong side*; `f32`'s 24-bit
-  mantissa reports a genuine turn as *collinear*. Both failures are pinned by
-  tests against real counterexamples. `i64` makes every predicate exact — no
-  epsilons, no rounding, no overflow.
-- **The simulation is `f64`.** Skeleton nodes are irrational in general, so
-  there is no lattice to compute *on*; `f32` resolves only ~0.004 at the far end
-  of the `i16` range, which is coarser than the algorithm's tolerances.
+That costs **one bit of range**: coordinates are capped at `-16384..=16383`
+(`Point::MIN_COORD`/`MAX_COORD`), and `Polygon` rejects anything outside. One
+expression sets the cap — the orientation determinant, which needs `2 * d^2` for
+the largest coordinate difference `d`:
 
-Node positions round to the lattice at the boundary, and `Node::exact` keeps the
-unrounded `f32`. See [`docs/DESIGN.md`](docs/DESIGN.md) for the width analysis.
+| coordinates | `2 * d^2` | in `i32`? |
+|---|---|---|
+| full `i16` | 8,589,672,450 | **overflows**, reporting the *wrong side* |
+| capped | 2,147,352,578 | fits, with 131,069 to spare |
+
+So one bit buys **exact** predicates: no epsilon, no rounding, no overflow.
+`f32` cannot do that job at any range — the tests pin a real triple *inside* the
+cap where it calls a genuine turn collinear, and one outside where `i32` flips
+sign. Both were found by search, not asserted.
+
+The simulation is `f32`. Skeleton nodes are irrational in general, so there is
+no lattice to compute *on*; positions round back to it at the boundary and
+`Node::exact` keeps the unrounded value. The cap is also what leaves `f32`
+enough absolute resolution — ~0.002 at worst — to work in.
+
+[`docs/DESIGN.md`](docs/DESIGN.md) has the full analysis, including what this
+costs in robustness.
 
 ## Not the medial axis
 
@@ -178,14 +190,25 @@ hardware instruction to within 1 ULP, so the feature flag cannot change results.
 
 ## Performance
 
-`O(n^2 log n)` typical, `O(n^2)` for convex input, `O(n)` space. The quadratic
-term is the split-event search.
+Measured with `cargo run --release --example bench`, which reports the empirical
+growth exponent rather than a claim:
 
-Sub-quadratic algorithms exist. This crate does not use one: the priority is
-**correct > understandable > fast**, in that order, and most of the real bugs
-here hid in event bookkeeping rather than geometry — which is an argument for
-code you can check by reading. If you need a straight skeleton of a
-hundred-thousand-vertex polygon, this is the wrong crate.
+| input | 1024 vertices | scaling |
+|---|---|---|
+| convex | 1.1 ms | ~n^1.3 |
+| comb (512 reflex) | 8.9 ms | ~n^1.9 |
+| random star (512 reflex) | 13 ms | ~n^2.1 |
+
+**Convex input is sub-quadratic** — it has no reflex vertices, so it never
+searches for split events at all. With reflex vertices the search is `O(n)` per
+reflex vertex, giving `O(n^2)` overall, and the measurements agree.
+
+Beating `O(n^2)` in the worst case needs the motorcycle-graph machinery of
+Eppstein–Erickson or Cheng–Vigneron. That is a different algorithm and a much
+larger one; practical implementations (CGAL, Surfer2) also ship an `O(n^2)`
+worst case. `docs/DESIGN.md` explains what it would take and why it is not here.
+
+Space is `O(n)`.
 
 ## Documentation
 

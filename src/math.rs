@@ -1,26 +1,41 @@
 //! Internal floating-point scaffolding.
 //!
-//! The crate is `no_std`-compatible with **zero required dependencies**, which
-//! rules out both `std`'s `f64::sqrt` and the `libm` crate. The only
-//! transcendental operation the algorithm needs is a square root (used solely
-//! to normalise edge normals — see [`crate::wavefront`]), so we carry a small
-//! correctly-rounding-enough implementation instead of taking a dependency.
+//! # No `f64`, anywhere
 //!
-//! When the `std` feature is on we defer to the hardware instruction, which is
+//! The whole crate computes in `f32`. Nothing here, or anywhere else, uses
+//! `f64`: the algorithm is meant to be portable to hardware where `f64` is
+//! slow or absent, and a type you only use "internally" is still a type the
+//! hardware has to have.
+//!
+//! That is affordable only because the coordinate range is capped at
+//! [`Point::MAX_COORD`], which is what buys `f32` enough absolute resolution to
+//! work in. `docs/DESIGN.md` has the arithmetic.
+//!
+//! # No dependencies either
+//!
+//! `no_std` with **zero required dependencies** rules out both `std`'s
+//! `f32::sqrt` and the `libm` crate. A square root is the only transcendental
+//! the algorithm needs — solely to normalise edge normals, see
+//! [`crate::wavefront`] — so we carry a small implementation rather than take a
+//! dependency for one function.
+//!
+//! With the `std` feature on we defer to the hardware instruction, which is
 //! both faster and correctly rounded.
+//!
+//! [`Point::MAX_COORD`]: crate::Point::MAX_COORD
 
 use core::ops::{Add, AddAssign, Mul, Neg, Sub};
 
-/// Square root of a non-negative `f64`.
+/// Square root of a non-negative `f32`.
 ///
-/// With the `std` feature this is `f64::sqrt` (correctly rounded, typically a
+/// With the `std` feature this is `f32::sqrt` (correctly rounded, typically a
 /// single CPU instruction). Without it, this is a Newton–Raphson refinement
 /// seeded by the classic exponent-halving bit trick.
 ///
 /// The `no_std` path agrees with the `std` path to within 1 ULP for all finite
 /// non-negative inputs, which is verified by a test in this module.
 #[inline]
-pub fn sqrt(x: f64) -> f64 {
+pub fn sqrt(x: f32) -> f32 {
     #[cfg(feature = "std")]
     {
         x.sqrt()
@@ -35,39 +50,46 @@ pub fn sqrt(x: f64) -> f64 {
 /// against the `std` implementation.
 #[inline]
 #[allow(dead_code)]
-pub(crate) fn sqrt_soft(x: f64) -> f64 {
+pub(crate) fn sqrt_soft(x: f32) -> f32 {
     if x.is_nan() || x < 0.0 {
-        return f64::NAN;
+        return f32::NAN;
     }
-    if x == 0.0 || x == f64::INFINITY {
-        // Preserves the sign of zero, matching `f64::sqrt`.
+    if x == 0.0 || x == f32::INFINITY {
+        // Preserves the sign of zero, matching `f32::sqrt`.
         return x;
+    }
+
+    // Denormals break the exponent trick below, so scale them up into the
+    // normal range, take the root there, and scale the answer back by the
+    // square root of the same factor.
+    if x < f32::MIN_POSITIVE {
+        return sqrt_soft(x * 16_777_216.0) * (1.0 / 4096.0);
     }
 
     // Seed: halving the biased exponent approximates halving the exponent,
     // which approximates a square root to within a factor of ~2.
     let bits = x.to_bits();
-    let mut y = f64::from_bits((bits >> 1) + (0x1ff8_0000_0000_0000));
+    let mut y = f32::from_bits((bits >> 1) + 0x1fc0_0000);
 
     // Newton–Raphson on f(y) = y^2 - x. Each step doubles the correct digits;
-    // the seed is good to ~5 bits, so 5 steps saturate f64's 53-bit mantissa.
-    for _ in 0..5 {
+    // the seed is good to ~5 bits, so 4 steps saturate f32's 24-bit mantissa.
+    for _ in 0..4 {
         y = 0.5 * (y + x / y);
     }
     y
 }
 
-/// A 2D vector in the algorithm's internal `f64` working space.
+/// A 2D vector in the algorithm's internal `f32` working space.
 ///
 /// Public input and output coordinates are `i16` (see [`crate::Point`]); this
-/// type exists only between them. See `docs/DESIGN.md` for why the interior of
-/// the algorithm is `f64` rather than `f32`.
+/// type exists only between them. See `docs/DESIGN.md` for why `f32` is enough,
+/// and what the coordinate cap has to do with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec2 {
     /// Horizontal component.
-    pub x: f64,
+    pub x: f32,
     /// Vertical component.
-    pub y: f64,
+    pub y: f32,
 }
 
 impl Vec2 {
@@ -76,13 +98,13 @@ impl Vec2 {
 
     /// Constructs a vector from its components.
     #[inline]
-    pub const fn new(x: f64, y: f64) -> Self {
+    pub const fn new(x: f32, y: f32) -> Self {
         Vec2 { x, y }
     }
 
     /// Dot product `self · other`.
     #[inline]
-    pub fn dot(self, other: Vec2) -> f64 {
+    pub fn dot(self, other: Vec2) -> f32 {
         self.x * other.x + self.y * other.y
     }
 
@@ -90,20 +112,20 @@ impl Vec2 {
     /// parallelogram they span. Positive when `other` is counter-clockwise
     /// from `self`.
     #[inline]
-    pub fn cross(self, other: Vec2) -> f64 {
+    pub fn cross(self, other: Vec2) -> f32 {
         self.x * other.y - self.y * other.x
     }
 
     /// Euclidean length.
     #[inline]
-    pub fn length(self) -> f64 {
+    pub fn length(self) -> f32 {
         sqrt(self.dot(self))
     }
 
     /// Squared Euclidean length. Prefer this over [`Vec2::length`] when
     /// comparing magnitudes, since it avoids a square root.
     #[inline]
-    pub fn length_squared(self) -> f64 {
+    pub fn length_squared(self) -> f32 {
         self.dot(self)
     }
 
@@ -159,10 +181,10 @@ impl Sub for Vec2 {
     }
 }
 
-impl Mul<f64> for Vec2 {
+impl Mul<f32> for Vec2 {
     type Output = Vec2;
     #[inline]
-    fn mul(self, rhs: f64) -> Vec2 {
+    fn mul(self, rhs: f32) -> Vec2 {
         Vec2::new(self.x * rhs, self.y * rhs)
     }
 }
@@ -187,14 +209,14 @@ mod tests {
             1.0,
             2.0,
             4.0,
-            1e-300,
-            1e300,
+            1e-30,
+            1e30,
             0.5,
-            65535.0,
-            65535.0 * 65535.0 * 2.0,
-            f64::MIN_POSITIVE,
-            f64::MAX,
-            3.0000000001,
+            32767.0,
+            32767.0 * 32767.0 * 2.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            3.0000001,
         ];
         for x in cases {
             let soft = sqrt_soft(x);
@@ -207,11 +229,20 @@ mod tests {
     #[test]
     fn soft_sqrt_matches_std_over_a_sweep() {
         // Walk a wide range of magnitudes and mantissas.
-        let mut x = 1e-12f64;
+        let mut x = 1e-12f32;
         while x < 1e12 {
             let ulps = (sqrt_soft(x).to_bits() as i64 - x.sqrt().to_bits() as i64).abs();
             assert!(ulps <= 1, "sqrt({x}) differed by {ulps} ulps");
             x *= 1.000_137;
+        }
+    }
+
+    /// Denormals defeat the exponent-halving seed, so they take a scaled path.
+    #[test]
+    fn soft_sqrt_handles_denormals() {
+        for x in [1e-40f32, 1e-44, f32::MIN_POSITIVE / 2.0, f32::from_bits(1)] {
+            let ulps = (sqrt_soft(x).to_bits() as i64 - x.sqrt().to_bits() as i64).abs();
+            assert!(ulps <= 1, "sqrt({x:e}) differed by {ulps} ulps");
         }
     }
 
@@ -221,8 +252,8 @@ mod tests {
         assert!(sqrt_soft(0.0).is_sign_positive());
         assert!(sqrt_soft(-0.0).is_sign_negative(), "must preserve -0.0");
         assert!(sqrt_soft(-1.0).is_nan());
-        assert!(sqrt_soft(f64::NAN).is_nan());
-        assert_eq!(sqrt_soft(f64::INFINITY), f64::INFINITY);
+        assert!(sqrt_soft(f32::NAN).is_nan());
+        assert_eq!(sqrt_soft(f32::INFINITY), f32::INFINITY);
     }
 
     #[test]
@@ -241,6 +272,6 @@ mod tests {
     fn vec2_normalize_rejects_degenerate() {
         assert!(Vec2::ZERO.normalize().is_none());
         let n = Vec2::new(3.0, 4.0).normalize().unwrap();
-        assert!((n.length() - 1.0).abs() < 1e-15);
+        assert!((n.length() - 1.0).abs() < 1e-6);
     }
 }

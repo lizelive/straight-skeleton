@@ -121,6 +121,18 @@ pub enum PolygonError {
         /// The most that can be numbered.
         max: usize,
     },
+    /// A vertex lies outside the crate's coordinate range.
+    ///
+    /// Coordinates are capped at [`Point::MIN_COORD`]`..=`[`Point::MAX_COORD`],
+    /// one bit narrower than `i16`. That bit is what makes every predicate
+    /// exact in `i32` and lets the whole algorithm run without `f64` — see
+    /// [`Point`] and [`crate::predicates`]. Scale the input down to fit.
+    CoordinateOutOfRange {
+        /// The ring it is in.
+        ring: RingId,
+        /// The offending point.
+        point: Point,
+    },
 }
 
 impl fmt::Display for PolygonError {
@@ -158,6 +170,15 @@ impl fmt::Display for PolygonError {
             PolygonError::TooManyVertices { count, max } => {
                 write!(f, "polygon has {count} vertices; the maximum is {max}")
             }
+            PolygonError::CoordinateOutOfRange { ring, point } => write!(
+                f,
+                "ring {} has vertex ({}, {}), outside the supported range {}..={}",
+                ring.0,
+                point.x,
+                point.y,
+                Point::MIN_COORD,
+                Point::MAX_COORD
+            ),
         }
     }
 }
@@ -176,6 +197,7 @@ impl std::error::Error for PolygonError {}
 /// - The outer ring winds **counter-clockwise** and holes wind **clockwise**,
 ///   so the polygon's interior is always on the *left* of every directed edge.
 ///   Rings supplied the other way round are reversed automatically.
+/// - Every coordinate is within [`Point::MIN_COORD`]`..=`[`Point::MAX_COORD`].
 /// - Every ring has at least 3 vertices, no repeated consecutive vertices, and
 ///   encloses a non-zero area.
 /// - No two edges cross, and no vertex is a zero-width spike.
@@ -471,10 +493,10 @@ impl Polygon {
 
     /// Rejects polygons whose edges cross.
     ///
-    /// This is the naive all-pairs test, O(n^2). It is comfortably the
-    /// cheapest part of building a skeleton (which is itself O(n^2 log n)), and
-    /// keeping it obvious is worth more than the constant factor — consistent
-    /// with the crate's correct > understandable > fast ordering.
+    /// This is the naive all-pairs test, O(n^2) — the same order as building
+    /// the skeleton itself, and with a far smaller constant, so it is not what
+    /// anyone will notice. Keeping it obvious is worth more, consistent with
+    /// the crate's correct > understandable > fast ordering.
     fn check_simple(&self) -> Result<(), PolygonError> {
         let n = self.edge_count();
         for i in 0..n {
@@ -556,6 +578,14 @@ fn push_ring(
             ring: id,
             count: ring.len(),
         });
+    }
+
+    // Checked before anything else: every predicate below is only exact inside
+    // the cap, and `signed_area2` debug-asserts it.
+    for &p in ring {
+        if !p.in_range() {
+            return Err(PolygonError::CoordinateOutOfRange { ring: id, point: p });
+        }
     }
 
     for i in 0..ring.len() {
@@ -731,6 +761,32 @@ mod tests {
     fn rejects_too_few_vertices() {
         let e = Polygon::from_outer(&[Point::new(0, 0), Point::new(1, 1)]).unwrap_err();
         assert!(matches!(e, PolygonError::TooFewVertices { count: 2, .. }));
+    }
+
+    #[test]
+    fn rejects_coordinates_outside_the_cap() {
+        // One past the cap on a single coordinate is enough.
+        let e = Polygon::from_outer(&[Point::new(0, 0), Point::new(16384, 0), Point::new(0, 100)])
+            .unwrap_err();
+        assert!(
+            matches!(e, PolygonError::CoordinateOutOfRange { point, .. } if point.x == 16384),
+            "got {e:?}"
+        );
+
+        // And the negative side.
+        assert!(matches!(
+            Polygon::from_outer(&[Point::new(0, 0), Point::new(100, 0), Point::new(0, -16385)])
+                .unwrap_err(),
+            PolygonError::CoordinateOutOfRange { .. }
+        ));
+
+        // Right at the cap is fine.
+        assert!(Polygon::from_outer(&[
+            Point::new(Point::MIN_COORD, Point::MIN_COORD),
+            Point::new(Point::MAX_COORD, Point::MIN_COORD),
+            Point::new(Point::MAX_COORD, Point::MAX_COORD),
+        ])
+        .is_ok());
     }
 
     #[test]

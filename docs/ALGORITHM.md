@@ -146,44 +146,74 @@ so there is no need for a 2D intersection test. Project their separation onto
 the edge's own direction and ask when it reaches zero. That is linear in `t`, so
 it is one divide, with no special cases (`Sim::edge_event`).
 
-**Split** is the expensive one. A reflex vertex is tested against every wavefront
-edge: solve for when it reaches that edge's moving line, then check the hit
-actually lands **within the live segment**, not merely on its infinite supporting
-line. That last check is what separates a real split from a bisector sailing past
-outside the edge. It is `O(n)` per reflex vertex, and it is where the quadratic
-term comes from.
+**Split** is the expensive one, and how you ask the question decides whether the
+whole algorithm works or melts down.
 
-## Staleness, and the bug it hides
+The naive version asks the whole question at once: *when does this reflex vertex
+land on a live stretch of some other edge?* That needs the current endpoints of
+every candidate edge — and those endpoints belong to a part of the wavefront
+arbitrarily far away. It couples everything to everything. See below.
 
-Events are queued, never removed; obsolete ones are recognised when popped. That
-needs care, and getting it subtly wrong produced the nastiest bug in this
-crate's history.
+The version here asks a deliberately weaker question (`split_lower_bound`):
 
-A split event's timing is computed from **three** vertices: the reflex vertex,
-and the two endpoints of the edge it is aimed at. Move any of them and the timing
-is worthless. But the two endpoints belong to a completely different part of the
-wavefront — so an ordinary edge event over *there* silently invalidates an event
-owned by a vertex over *here*.
+> when does this vertex reach some edge's **moving line** — never mind whether it
+> lands on a live stretch of it?
 
-Reschedule only the vertices you touched, and that vertex is never rescheduled.
-It never fires again. Its wavefront sails straight through the boundary, and you
-get skeleton nodes sitting outside the polygon.
+That is *only a lower bound* on the true split time. It is never late, though,
+which is the only property needed for popping events in time order to stay
+correct. And it is cheap to keep true: an edge's wavefront slides along its own
+offset track and never leaves it, so the answer depends only on the vertex's
+trajectory and the edge's original line. **Nothing happening elsewhere can
+change it.**
 
-Nor can it be fixed by checking staleness lazily on pop: the stale event may sit
-*later* in the queue than the true one, so by the time it surfaces, the moment to
-act is long past.
+The real question is settled later, in `handle_split_event`, when the event is
+popped. By then `now == t`, every earlier event has been processed, and the
+wavefront's shape at `t` is not a forecast but settled fact — so
+`live_stretch_at` simply *looks*. If the vertex came down off the end of every
+live stretch, no split happens: the edge is struck off (a vertex travels in a
+straight line, so it meets that line once and the question is closed for good)
+and the next candidate is queued.
 
-So `Sim` keeps a reverse index, `dependents[j]` — every vertex whose queued event
-was computed from `j`'s geometry. Touching `j` marks all of them dirty, and the
-simulation refuses to advance until every dirty vertex has a fresh event. Two
-distinct stamps keep the two concerns apart:
+The scan is `O(n)` per reflex vertex, and it is the only non-constant step left.
+
+## Staleness, and the meltdown it hid
+
+Events are queued, never removed; obsolete ones are recognised when popped. Two
+independent stamps do it, and conflating them loses events:
 
 - `gen`, bumped when a vertex **moves or is relinked** — invalidates events
-  computed *from* it, anywhere in the wavefront.
+  computed *from* it.
 - `evt`, bumped when a vertex is **rescheduled** — supersedes only its own
   previous event, disturbing nothing else.
 
-Conflating them either loses events or cascades forever.
+The critical property is that an event's `refs` — the vertices its timing was
+computed from — stay **O(1)**: the owner and its one neighbour. So `touch`
+marks a vertex and its `prev`, and that is provably complete, because exactly
+two events are computed from any vertex's geometry: its own, and its
+predecessor's edge event watching the two of them converge.
+
+It is worth seeing what happens when that is not true, because this crate did it
+the other way first and the result was spectacular. Stamping a split event with
+the two endpoints of the edge it was aimed at made a vertex's event depend on a
+part of the wavefront arbitrarily far away. Then:
+
+1. any event invalidated events all over the polygon;
+2. every reschedule re-registered more dependencies;
+3. which made the next event invalidate even more.
+
+It fed back on itself. A 132-vertex comb took 124ms; a 260-vertex one asked for
+**27GB** and died. Measured growth: **n^5.5**. The file you are reading claimed
+`O(n^2 log n)` at the time — the claim was theory, and nobody had run it.
+
+The fix was not better bookkeeping. It was noticing that a split's *timing never
+depended on those endpoints in the first place*, which is what `split_lower_bound`
+is. The same comb now runs 1028 vertices in 8.9ms.
+
+A second, smaller one hid behind it: the struck-off list was scanned linearly
+*inside* the per-edge loop, so one scan cost `O(n * rejections)`. Sorting it and
+binary-searching took a random star from `n^3.0` to `n^2.2`.
+
+Both were bookkeeping, not geometry. That is the argument for measuring.
 
 ## The degeneracies that actually bite
 
@@ -231,21 +261,42 @@ exposes the next.
 
 A two-vertex loop stalls for the same reason and is resolved the same way.
 
-## Complexity
+## Complexity, and the meltdown that hid in it
 
-| | time | why |
+Measured, with `cargo run --release --example bench`:
+
+| input | scaling | why |
 |---|---|---|
-| Convex polygon | `O(n^2)` | no reflex vertices, so no split search; the `n^2` is the input's self-intersection check |
-| General | `O(n^2 log n)` typical | each reflex vertex scans the wavefront |
-| Constrained | `+ O(n^2)` per distinct limit | every vertex's velocity can bend when an edge stops |
+| convex | ~n^1.3 | no reflex vertices, so `split_lower_bound` is never called |
+| reflex-heavy | ~n^1.9 to n^2.1 | `O(1)` events, each `O(n)` to schedule |
 
 Space is `O(n)`.
 
-Sub-quadratic algorithms exist (Eppstein–Erickson, Cheng–Vigneron). This crate
-does not use one. The ordering is **correct > understandable > fast**, and the
-straightforward search is dramatically easier to convince yourself of — which,
-given how many of the bugs above hid in the *bookkeeping* rather than the
-geometry, was the right trade.
+The event count is **linear** — about 5n pops for a comb, 10n for a star — and
+each event reschedules `O(1)` vertices. The quadratic term is entirely
+`split_lower_bound`'s scan over every edge.
+
+That is worth stating carefully, because an earlier version of this file claimed
+`O(n^2 log n)` and the real figure was `n^5.5`, on its way to asking for 27GB at
+260 vertices. The claim was theory; nobody had measured. Two things were wrong,
+and both were in the *bookkeeping*, not the geometry:
+
+- Split events depended on the endpoints of the edge they were aimed at, so any
+  event invalidated events all over the polygon, each reschedule registered more
+  dependencies, and it fed back on itself. Fixed by
+  [`split_lower_bound`](#finding-the-events): the timing never depended on those
+  endpoints in the first place.
+- The reject list was scanned linearly *inside* the per-edge loop, making one
+  scan `O(n * rejections)`. Sorting it and binary-searching took a star from
+  `n^3.0` to `n^2.2`.
+
+Beating `O(n^2)` in the worst case needs the motorcycle graph. Reflex vertices
+launch "motorcycles" along their bisectors; split events are exactly where
+motorcycles crash, and — crucially — motorcycle traces are **static rays**, so
+they can go in a spatial index, which moving wavefront edges cannot. Given the
+motorcycle graph, the skeleton follows in `O(n log n)` (Cheng–Vigneron,
+Huber–Held). It is a different algorithm, and a much larger one; CGAL and
+Surfer2 ship an `O(n^2)` worst case too.
 
 ## Where it is not the medial axis
 
