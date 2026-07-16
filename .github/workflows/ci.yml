@@ -53,7 +53,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
-      - run: cargo test --no-default-features
+      # Doctests are excluded here, not skipped for convenience: they are
+      # separate binaries that link `std` regardless, and they document the
+      # default build. The `no_std` library itself is what needs covering.
+      - run: cargo test --no-default-features --lib --tests
       # The examples are part of the test surface: `roof` asserts every panel
       # is planar, which only holds if the whole pipeline is correct.
       - run: cargo run --example svg

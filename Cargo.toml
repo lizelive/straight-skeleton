@@ -47,6 +47,17 @@ missing_debug_implementations = "warn"
 [lints.clippy]
 all = "warn"
 
+# Both examples write files and print, so they cannot build without `std`.
+# Declaring that lets `--all-targets --no-default-features` skip them instead
+# of failing.
+[[example]]
+name = "svg"
+required-features = ["std"]
+
+[[example]]
+name = "roof"
+required-features = ["std"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
