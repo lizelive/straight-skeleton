@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in CI is a failure. Anything less and they accumulate.
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Lint the no-default-features build too: it takes different `cfg`
+      # branches, so it can break while the default build stays green.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+      - run: cargo test --no-default-features
+      # The examples are part of the test surface: `roof` asserts every panel
+      # is planar, which only holds if the whole pipeline is correct.
+      - run: cargo run --example svg
+      - run: cargo run --example roof
+
+  features:
+    name: feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Each feature on its own
+        run: |
+          for f in serde geo-types glam mint num-traits; do
+            echo "::group::--features $f"
+            cargo check --no-default-features --features "$f"
+            cargo check --features "$f"
+            echo "::endgroup::"
+          done
+
+  no_std:
+    name: no_std
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # A bare-metal target with no `std` at all: if anything reaches for
+          # it, this fails to build rather than silently linking it in.
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --no-default-features --target thumbv7em-none-eabihf
+      - name: no_std with every optional integration
+        run: >
+          cargo build --no-default-features
+          --features serde,geo-types,glam,mint,num-traits
+          --target thumbv7em-none-eabihf
+
+  msrv:
+    name: MSRV 1.75
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      # Build, not test: dev-dependencies may need a newer compiler than the
+      # library itself, and it is the library's MSRV being promised.
+      - run: cargo build --all-features
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Same invocation docs.rs uses, so a broken intra-doc link is caught here
+      # rather than after publishing.
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings --cfg docsrs"
