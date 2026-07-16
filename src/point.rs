@@ -116,7 +116,7 @@ fn round_to_i16(v: f64) -> i16 {
 
 /// `f64::round` is unavailable in `no_std`, so we spell it out.
 #[inline]
-fn round_half_away_from_zero(v: f64) -> f64 {
+pub(crate) fn round_half_away_from_zero(v: f64) -> f64 {
     // `as i64` truncates toward zero; nudging by 0.5 in the sign direction
     // turns that into round-half-away-from-zero for the magnitudes we see.
     if v >= 0.0 {

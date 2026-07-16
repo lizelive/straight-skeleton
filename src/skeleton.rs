@@ -454,6 +454,27 @@ impl Skeleton {
         }
     }
 
+    /// How many input edges the polygon had.
+    ///
+    /// Each one owns exactly one [`face`](Skeleton::face), so this is also the
+    /// number of faces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use straight_skeleton::{skeleton, Point, Polygon};
+    ///
+    /// let square = Polygon::from_outer(&[
+    ///     Point::new(0, 0), Point::new(10, 0), Point::new(10, 10), Point::new(0, 10),
+    /// ])?;
+    /// assert_eq!(skeleton(&square)?.input_edge_count(), 4);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[inline]
+    pub fn input_edge_count(&self) -> usize {
+        self.edge_nodes.len()
+    }
+
     /// Every input edge's face, in edge order.
     ///
     /// Returns `None` if any face cannot be walked.

@@ -86,8 +86,25 @@ let skel = skeleton_constrained(&square, &[3.0, f32::INFINITY, f32::INFINITY, f3
 This is not a bolted-on mode: both entry points run the same *weighted*
 wavefront, and all-`INFINITY` limits reproduce `skeleton()` exactly.
 
-**Faces, so roofs are nearly free.** Each input edge owns one face; lift its
-nodes to `z = offset` and the face is planar. One face, one roof panel.
+**Roofs, in `i16`, built in.** Each input edge owns one skeleton face; lift its
+nodes to `z = offset * pitch` and the face is a flat roof panel. `Roof` does
+that for you, and every panel carries the wall it rises from:
+
+```rust
+use straight_skeleton::Roof;
+
+let roof = Roof::new(&skel, 0.5)?;          // pitch: rise over run
+assert_eq!(roof.panels().len(), 4);          // one panel per wall
+let apex: i16 = roof.ridge_height();         // i16, like everything else
+
+for panel in roof.panels() {
+    let wall = panel.wall;                   // which wall this panel rises from
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Panels are planar by construction, not by fitting: every point on one is
+`offset` from the same wall's line, and height is linear in that distance.
 
 **Holes, with no special case.** A hole is a wavefront loop that expands instead
 of shrinking. Its corners come out reflex, and reflex corners already split the
@@ -101,8 +118,9 @@ cargo run --example roof    # writes hip roofs as .obj to target/roofs/
 ```
 
 `svg` renders each shape with its skeleton, colouring arcs by their source edge
-so the provenance is visible. `roof` lifts skeletons into 3D and asserts every
-panel really is planar.
+so the provenance is visible. `roof` uses the library's `Roof` type and only
+adds the OBJ serialisation, since choosing a file format is the caller's
+business rather than the crate's.
 
 ## Coordinates
 

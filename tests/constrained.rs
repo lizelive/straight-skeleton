@@ -183,6 +183,98 @@ fn limits_apply_per_edge() {
     check_constrained(&poly, &skel, &limits, TOL);
 }
 
+/// A limit of zero on a **single** wall: that wall never moves at all, while
+/// its neighbours run free.
+///
+/// This is the sharpest test of the "an edge that stops is just an edge at
+/// speed zero" model, because the stopped edge never has a moving phase to be
+/// wrong about. Its two corners must slide straight **along** it rather than
+/// away from it, so both arcs leaving that wall stay pinned to `y = 0`.
+#[test]
+fn a_single_wall_with_a_zero_limit_never_moves() {
+    let poly = Polygon::from_outer(&rect(40, 20)).unwrap();
+    // Edge 0 is the bottom wall, y = 0. It is frozen from the start.
+    let limits = [0.0, f32::INFINITY, f32::INFINITY, f32::INFINITY];
+    let skel = skeleton_constrained(&poly, &limits).unwrap();
+
+    check_constrained(&poly, &skel, &limits, TOL);
+
+    // The other three walls are unconstrained, so the wavefront still runs.
+    assert!(
+        skel.max_offset() > 0.0,
+        "only one wall was limited; the rest must keep going"
+    );
+
+    // Every node touching the frozen wall must lie *on* it.
+    let touching: Vec<_> = skel
+        .nodes()
+        .iter()
+        .filter(|n| n.sources.contains(&EdgeId(0)))
+        .collect();
+    assert!(
+        touching.len() >= 2,
+        "the frozen wall still bounds part of the skeleton"
+    );
+    for n in &touching {
+        assert!(
+            n.exact[1].abs() < 1e-3,
+            "node at {:?} claims the frozen wall but has left it",
+            n.exact
+        );
+    }
+
+    // Its two corners slide along it, inward from (0,0) and (40,0), rather
+    // than lifting off along a 45-degree bisector.
+    let mut on_wall: Vec<i16> = touching
+        .iter()
+        .filter(|n| !n.is_boundary())
+        .map(|n| n.position.x)
+        .collect();
+    on_wall.sort();
+    assert!(
+        on_wall.iter().all(|&x| x > 0 && x < 40),
+        "corners should slide inward along the wall, got x = {on_wall:?}"
+    );
+}
+
+/// Zero on *every* wall is the degenerate limit: nothing moves, so nothing is
+/// traced.
+#[test]
+fn a_zero_limit_on_every_wall_traces_nothing() {
+    let poly = Polygon::from_outer(&l_shape()).unwrap();
+    let limits = vec![0.0; poly.edge_count()];
+    let skel = skeleton_constrained(&poly, &limits).unwrap();
+
+    assert_eq!(skel.max_offset(), 0.0);
+    assert_eq!(skel.arc_count(), 0);
+    assert_eq!(skel.node_count(), poly.vertex_count());
+    check_boundary_nodes(&poly, &skel);
+}
+
+/// A zero limit on a wall of a polygon that has reflex corners, so the frozen
+/// wall has to interact with split events rather than just its own neighbours.
+#[test]
+fn a_zero_limit_wall_on_a_reflex_polygon() {
+    let poly = Polygon::from_outer(&l_shape()).unwrap();
+    let mut limits = vec![f32::INFINITY; poly.edge_count()];
+    limits[0] = 0.0;
+    let skel = skeleton_constrained(&poly, &limits).unwrap();
+
+    check_constrained(&poly, &skel, &limits, TOL);
+    for n in skel
+        .nodes()
+        .iter()
+        .filter(|n| n.sources.contains(&EdgeId(0)))
+    {
+        // Edge 0 of the L runs along y = 0.
+        assert!(
+            n.exact[1].abs() < 1e-3,
+            "node at {:?} claims the frozen wall but has left it",
+            n.exact
+        );
+    }
+}
+
 /// Once an edge stops, its neighbours keep moving and slide *along* it, rather
 /// than over it. So nothing on that edge's side gets further from it than the
 /// limit allowed.

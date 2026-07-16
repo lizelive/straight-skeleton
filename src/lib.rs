@@ -74,7 +74,21 @@
 //!
 //! Each input edge also owns one skeleton **[face]**, the region its wavefront
 //! swept. The faces tile the polygon, and every face is planar once lifted to
-//! `z = offset` — which is exactly why this builds roofs.
+//! `z = offset` — which is why [`Roof`] can raise a hip roof over a floor plan
+//! by reading the skeleton off rather than computing anything:
+//!
+//! ```
+//! use straight_skeleton::{skeleton, Point, Polygon, Roof};
+//!
+//! let plan = Polygon::from_outer(&[
+//!     Point::new(0, 0), Point::new(120, 0), Point::new(120, 80), Point::new(0, 80),
+//! ])?;
+//!
+//! let roof = Roof::new(&skeleton(&plan)?, 0.5)?;
+//! assert_eq!(roof.panels().len(), 4);   // one flat panel per wall
+//! assert_eq!(roof.ridge_height(), 20);  // i16, like every other coordinate
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
 //! One caveat, and it is a real one rather than an implementation wrinkle: a
 //! straight skeleton is **not** the medial axis. It bisects edges' infinite
@@ -165,6 +179,7 @@ extern crate std;
 mod math;
 mod point;
 mod polygon;
+mod roof;
 mod skeleton;
 mod wavefront;
 
@@ -180,6 +195,7 @@ mod interop;
 
 pub use point::Point;
 pub use polygon::{EdgeId, Polygon, PolygonError, RingId, VertexId};
+pub use roof::{Panel, Point3, Roof, RoofError, RoofVertex};
 pub use skeleton::{Arc, ArcId, Node, NodeId, NodeKind, Skeleton};
 pub use wavefront::SkeletonError;
 
