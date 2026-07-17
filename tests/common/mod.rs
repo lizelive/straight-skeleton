@@ -317,6 +317,80 @@ pub fn l_shape() -> Vec<Point> {
     ]
 }
 
+/// A "comb": one long base wall facing several deep slots, CCW. This is the
+/// concave shape whose mansard break lands on a node offset — the case that
+/// tripped `BreakSplitsPanel`.
+pub fn comb() -> Vec<Point> {
+    [
+        (0, 0),
+        (120, 0),
+        (120, 90),
+        (100, 90),
+        (100, 30),
+        (80, 30),
+        (80, 90),
+        (60, 90),
+        (60, 30),
+        (40, 30),
+        (40, 90),
+        (20, 90),
+        (20, 30),
+        (0, 30),
+    ]
+    .into_iter()
+    .map(|(x, y)| Point::new(x, y))
+    .collect()
+}
+
+/// A wider, deeper comb, on a different lattice so its slots and base put node
+/// offsets at different integers than [`comb`].
+pub fn deep_comb() -> Vec<Point> {
+    [
+        (0, 0),
+        (200, 0),
+        (200, 140),
+        (180, 140),
+        (180, 40),
+        (150, 40),
+        (150, 140),
+        (120, 140),
+        (120, 40),
+        (90, 40),
+        (90, 140),
+        (60, 140),
+        (60, 40),
+        (30, 40),
+        (30, 140),
+        (10, 140),
+        (10, 40),
+        (0, 40),
+    ]
+    .into_iter()
+    .map(|(x, y)| Point::new(x, y))
+    .collect()
+}
+
+/// A base wall whose wavefront is split apart by two inward spikes, so its face
+/// dips below the mansard break and back three times: the break cuts it into
+/// several lower and upper pieces, not just one of each.
+pub fn twin_spike() -> Vec<Point> {
+    [
+        (0, 0),
+        (200, 0),
+        (200, 80),
+        (145, 80),
+        (140, 8),
+        (135, 80),
+        (65, 80),
+        (60, 8),
+        (55, 80),
+        (0, 80),
+    ]
+    .into_iter()
+    .map(|(x, y)| Point::new(x, y))
+    .collect()
+}
+
 /// A plus/cross shape with four reflex vertices.
 pub fn plus_shape() -> Vec<Point> {
     vec![

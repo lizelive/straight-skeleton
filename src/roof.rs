@@ -357,18 +357,22 @@ pub enum RoofError {
         /// The offset the rest of the roof reaches.
         reaches: f32,
     },
-    /// A [`Profile::Mansard`]'s break would cut one panel into more than two
-    /// pieces, and the roof does not attempt to guess how they join.
+    /// A [`Profile::Mansard`]'s break left a wall's face in pieces that could
+    /// not be closed back up into coherent panels.
     ///
-    /// The break is a straight line across a panel, so it normally splits it in
-    /// two. A panel whose outline crosses that line more than twice — which
-    /// takes a wall whose wavefront was split apart by two separate reflex
-    /// vertices, and both halves surviving past the break — would come apart
-    /// into several. Refused rather than returned bent or self-touching.
+    /// The break is a straight line across a face, so it normally splits it into
+    /// a lower piece and an upper one — and a face whose wavefront was split
+    /// apart by two reflex vertices into several lower and upper pieces is
+    /// handled too, each piece emitted as its own panel. This is the safety net
+    /// for the geometry that is left: a face the break meets in a way that does
+    /// not resolve into closed pieces, which should not arise for the face of a
+    /// valid polygon. Refused rather than returned bent or self-touching.
     BreakSplitsPanel {
-        /// The wall whose panel the break cuts up.
+        /// The wall whose panel the break could not cleanly cut.
         wall: EdgeId,
-        /// How many times its outline crosses the break.
+        /// How many loose ends the break left on the face's outline. An odd
+        /// count is the tell — a closed outline must cross a line an even number
+        /// of times.
         crossings: usize,
     },
     /// A vertex would stand higher than `i16` can hold.
@@ -409,8 +413,8 @@ impl fmt::Display for RoofError {
             ),
             RoofError::BreakSplitsPanel { wall, crossings } => write!(
                 f,
-                "the mansard break crosses wall {}'s panel {crossings} times, so it \
-                 would come apart into more than two pieces",
+                "the mansard break left wall {}'s face with {crossings} loose ends, \
+                 so it could not be cut into coherent panels",
                 wall.0
             ),
             RoofError::HeightOverflow { node, height } => write!(
@@ -721,8 +725,9 @@ impl Roof {
     /// - [`RoofError::InvalidBreak`] likewise for a mansard's break.
     /// - [`RoofError::UnevenLimits`] if the skeleton's edges stopped at
     ///   different distances.
-    /// - [`RoofError::BreakSplitsPanel`] if a mansard's break would cut a panel
-    ///   into more than two pieces.
+    /// - [`RoofError::BreakSplitsPanel`] if a mansard's break leaves a face in
+    ///   pieces that cannot be closed back up (a safety net that should not fire
+    ///   for the face of a valid polygon).
     /// - [`RoofError::HeightOverflow`] if the plan is too wide for the pitch to
     ///   fit in `i16`.
     /// - [`RoofError::UnwalkableFace`] if a wall's face is not a closed region,
@@ -988,8 +993,15 @@ impl Build<'_> {
         Ok(id)
     }
 
-    /// Turns one wall's face into its panel, or into the two the break cuts it
-    /// into.
+    /// Turns one wall's face into its panels: one if the break misses it, or the
+    /// several the break cuts it into.
+    ///
+    /// The break is a level set of `offset`, and `offset` is affine across a
+    /// single face (it is the distance to the wall's own line), so the break is a
+    /// straight line **within this face**. Splitting a face is therefore
+    /// splitting a simple polygon by a line — see [`Build::split_at_break`] for
+    /// the general case, which cuts a face into as many lower and upper pieces as
+    /// the line leaves it in.
     fn push_slopes(
         &mut self,
         wall: EdgeId,
@@ -1007,7 +1019,9 @@ impl Build<'_> {
         let sides: Vec<i8> = face.iter().map(|&n| self.side(n, at)).collect();
 
         // Wholly on one side: the break does not reach this panel, or clears it
-        // entirely. Either way it stays in one piece.
+        // entirely. Either way it stays in one piece, corners untouched. Corners
+        // sitting *on* the break (side 0) do not cut it — they are the kerb the
+        // panel runs up to, not a crossing of it.
         if sides.iter().all(|&s| s <= 0) || sides.iter().all(|&s| s >= 0) {
             let band = if sides.iter().any(|&s| s > 0) { 1 } else { 0 };
             out.push(Panel {
@@ -1017,53 +1031,203 @@ impl Build<'_> {
             return Ok(());
         }
 
-        // The break is one straight line, so it enters a panel once and leaves
-        // once. More crossings than that means the panel is not being cut in two
-        // but into several, and the halves below would be nonsense.
-        let crossings = (0..face.len())
-            .filter(|&i| sides[i] * sides[(i + 1) % face.len()] < 0)
-            .count();
-        if crossings != 2 {
-            return Err(RoofError::BreakSplitsPanel { wall, crossings });
-        }
+        self.split_at_break(wall, face, &sides, at, out)
+    }
 
-        let mut lower = Vec::new();
-        let mut upper = Vec::new();
-        for i in 0..face.len() {
-            let j = (i + 1) % face.len();
+    /// Splits a face the break genuinely crosses into its lower and upper pieces.
+    ///
+    /// A face can end up in more than two pieces: a wall whose wavefront was
+    /// split apart by two reflex vertices has a face that dips below the break
+    /// and back more than once, so the break cuts it into several lower pieces
+    /// and several upper ones. This handles the general even-crossing partition,
+    /// of which the ordinary "one lower, one upper" split is the two-crossing
+    /// case. See [`Build::trace_band`] for the tracing itself.
+    fn split_at_break(
+        &mut self,
+        wall: EdgeId,
+        face: &[NodeId],
+        sides: &[i8],
+        at: f32,
+        out: &mut Vec<Panel>,
+    ) -> Result<(), RoofError> {
+        // Order break-line corners along the break, which is parallel to the
+        // wall. A face's first two nodes are the wall's own endpoints, so their
+        // difference is the wall's direction — projecting onto it sorts corners
+        // as they lie along the break.
+        let a0 = self.skel.node(face[0]).exact;
+        let a1 = self.skel.node(face[1]).exact;
+        let (dx, dy) = (a1[0] - a0[0], a1[1] - a0[1]);
+        let along = |v: RoofVertexId, verts: &[RoofVertex]| {
+            let e = verts[v.0 as usize].exact;
+            (e[0] - a0[0]) * dx + (e[1] - a0[1]) * dy
+        };
+
+        // The augmented boundary: the face's own corners, with a new one spliced
+        // in wherever an edge crosses the break strictly (a `-1`/`+1` pair). That
+        // makes every crossing of the break pass through a corner *on* it, so
+        // each piece is bounded by real corners rather than mid-edge points.
+        let mut bound: Vec<Bv> = Vec::with_capacity(face.len() + 4);
+        let n = face.len();
+        for i in 0..n {
             let v = RoofVertexId(face[i].0);
-            // A corner exactly on the break belongs to both halves, which is
-            // what makes them meet along it rather than overlap or gap.
-            if sides[i] <= 0 {
-                lower.push(v);
-            }
-            if sides[i] >= 0 {
-                upper.push(v);
-            }
+            let key = along(v, &self.verts);
+            bound.push(Bv {
+                id: v,
+                side: sides[i],
+                key,
+            });
+
+            let j = (i + 1) % n;
             if sides[i] * sides[j] < 0 {
                 let c = self.cut_between(face[i], face[j], at)?;
-                lower.push(c);
-                upper.push(c);
+                let key = along(c, &self.verts);
+                bound.push(Bv {
+                    id: c,
+                    side: 0,
+                    key,
+                });
             }
         }
+
+        let lower = self.trace_band(&bound, true, wall)?;
+        let upper = self.trace_band(&bound, false, wall)?;
 
         // A sliver with fewer than three corners encloses nothing; dropping it
         // is what keeps a break laid exactly on a node from emitting a
-        // degenerate panel.
-        if lower.len() >= 3 {
-            out.push(Panel {
-                kind: PanelKind::Slope { wall, band: 0 },
-                corners: lower,
-            });
-        }
-        if upper.len() >= 3 {
-            out.push(Panel {
-                kind: PanelKind::Slope { wall, band: 1 },
-                corners: upper,
-            });
+        // degenerate panel. Lower pieces first, so a wall reads eaves-up.
+        for (band, pieces) in [(0u8, lower), (1u8, upper)] {
+            for corners in pieces {
+                if corners.len() >= 3 {
+                    out.push(Panel {
+                        kind: PanelKind::Slope { wall, band },
+                        corners,
+                    });
+                }
+            }
         }
         Ok(())
     }
+
+    /// Traces the closed pieces of one band of a cut face.
+    ///
+    /// The band's boundary is made of two kinds of edge: stretches of the face's
+    /// own outline that lie on this side of the break, and chords *along* the
+    /// break that close those stretches back up. The outline stretches are known
+    /// outright; the chords are the puzzle, and they are recovered from where the
+    /// outline meets the break.
+    ///
+    /// The break is a straight line, so the band meets it along a set of disjoint
+    /// intervals. Each interval's two ends are an outline stretch ending on the
+    /// break and another starting off it again — so, sorted along the break, the
+    /// loose ends pair up consecutively, and joining each pair is the chord.
+    fn trace_band(
+        &self,
+        bound: &[Bv],
+        lower: bool,
+        wall: EdgeId,
+    ) -> Result<Vec<Vec<RoofVertexId>>, RoofError> {
+        let m = bound.len();
+        let in_band = |s: i8| if lower { s <= 0 } else { s >= 0 };
+
+        // `next[i]` is the corner following corner `i` around this band. Seed it
+        // from the outline: an edge is this band's boundary when both its ends
+        // are on this side (and it is not a stretch lying *along* the break,
+        // which is a chord's job, not an edge's).
+        let mut next = alloc::vec![usize::MAX; m];
+        let mut has_prev = alloc::vec![false; m];
+        for i in 0..m {
+            let j = (i + 1) % m;
+            let (si, sj) = (bound[i].side, bound[j].side);
+            if si == 0 && sj == 0 {
+                continue;
+            }
+            if in_band(si) && in_band(sj) {
+                next[i] = j;
+                has_prev[j] = true;
+            }
+        }
+
+        // The loose ends on the break: corners on it that the outline leaves by
+        // (need an outgoing chord) or arrives at (need an incoming one).
+        let mut needs_out: Vec<usize> = Vec::new();
+        let mut needs_in: Vec<usize> = Vec::new();
+        for i in 0..m {
+            if bound[i].side != 0 {
+                continue;
+            }
+            match (has_prev[i], next[i] != usize::MAX) {
+                (true, false) => needs_out.push(i),
+                (false, true) => needs_in.push(i),
+                // Fully joined already (a corner the break merely touches), or
+                // not part of this band at all.
+                _ => {}
+            }
+        }
+
+        // Sorted along the break, a loose end that needs a chord out and one that
+        // needs a chord in alternate, and each adjacent pair bounds one interval
+        // the band covers. Join them.
+        let mut ends: Vec<usize> = needs_out.iter().chain(&needs_in).copied().collect();
+        ends.sort_by(|&a, &b| bound[a].key.total_cmp(&bound[b].key));
+        if ends.len() % 2 != 0 {
+            return Err(RoofError::BreakSplitsPanel {
+                wall,
+                crossings: ends.len(),
+            });
+        }
+        for pair in ends.chunks_exact(2) {
+            let (a, b) = (pair[0], pair[1]);
+            // One end must be an exit, the other an entry; anything else is
+            // geometry this cannot make coherent pieces of.
+            let out_in = match (next[a] == usize::MAX, next[b] == usize::MAX) {
+                (true, false) => Some((a, b)),
+                (false, true) => Some((b, a)),
+                _ => None,
+            };
+            let Some((from, to)) = out_in else {
+                return Err(RoofError::BreakSplitsPanel {
+                    wall,
+                    crossings: ends.len(),
+                });
+            };
+            next[from] = to;
+        }
+
+        // Every loose end is joined now, so following `next` walks closed loops.
+        let mut pieces = Vec::new();
+        let mut seen = alloc::vec![false; m];
+        for start in 0..m {
+            if seen[start] || next[start] == usize::MAX {
+                continue;
+            }
+            let mut corners = Vec::new();
+            let mut cur = start;
+            while !seen[cur] {
+                seen[cur] = true;
+                corners.push(bound[cur].id);
+                cur = next[cur];
+                if cur == usize::MAX {
+                    return Err(RoofError::BreakSplitsPanel {
+                        wall,
+                        crossings: ends.len(),
+                    });
+                }
+            }
+            pieces.push(corners);
+        }
+        Ok(pieces)
+    }
+}
+
+/// One corner of a face's augmented boundary while a break is being traced
+/// through it: a face corner, or one the break spliced onto an edge.
+struct Bv {
+    /// The roof vertex this corner is.
+    id: RoofVertexId,
+    /// Which side of the break it falls: -1 below, +1 above, 0 on.
+    side: i8,
+    /// Its position projected along the break, for ordering the on-break corners.
+    key: f32,
 }
 
 /// Rounds a height onto the lattice, or `None` if it will not fit.

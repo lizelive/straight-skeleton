@@ -576,6 +576,110 @@ fn a_limit_below_the_break_never_reaches_the_shallow_band() {
     assert_eq!(roof.ridge_height(), 12, "6 * 2.0, all in the steep band");
 }
 
+/// Twice the plan area of a wall's whole face, straight from the skeleton — the
+/// area its panels must add back up to.
+fn face_area2(skel: &straight_skeleton::Skeleton, wall: EdgeId) -> f64 {
+    let face = skel.face(wall).unwrap();
+    let pts: Vec<[f64; 2]> = face
+        .iter()
+        .map(|&n| {
+            let e = skel.node(n).exact;
+            [e[0] as f64, e[1] as f64]
+        })
+        .collect();
+    let mut a = 0.0;
+    for i in 0..pts.len() {
+        let q = pts[(i + 1) % pts.len()];
+        a += pts[i][0] * q[1] - q[0] * pts[i][1];
+    }
+    a.abs()
+}
+
+/// Every wall's panels partition its face: they are all non-degenerate, and
+/// their plan areas add back up to the face's, with no gaps or overlaps.
+fn assert_walls_partition(skel: &straight_skeleton::Skeleton, roof: &Roof) {
+    for w in 0..skel.input_edge_count() as u16 {
+        let wall = EdgeId(w);
+        let panels: Vec<_> = roof.panels_of(wall).collect();
+        for p in &panels {
+            assert!(
+                p.corners.len() >= 3,
+                "wall {w}: a panel with {} corners encloses nothing",
+                p.corners.len()
+            );
+        }
+        let sum: f64 = panels.iter().map(|p| footprint_area(roof, p).abs()).sum();
+        let want = face_area2(skel, wall) / 2.0;
+        assert!(
+            (sum - want).abs() < 1.0 + 0.02 * want,
+            "wall {w}: panels cover {sum} but the face is {want}"
+        );
+    }
+}
+
+/// The bug: a mansard break that lands exactly on a node's offset used to be
+/// refused with `BreakSplitsPanel`, though the face splits cleanly. The comb's
+/// slots put node offsets on the integer lattice, so an integer break coincides.
+#[test]
+fn a_break_on_a_node_offset_still_splits() {
+    let plan = Polygon::from_outer(&comb()).unwrap();
+    let skel = skeleton(&plan).unwrap();
+
+    // 9.9 and 10.1 always worked; 10.0 landing on a node offset used to fail.
+    for &at in &[9.9f32, 10.0, 10.1] {
+        let roof = Roof::mansard(&skel, 2.0, at, 0.2)
+            .unwrap_or_else(|e| panic!("break {at} should build, got {e}"));
+        assert_panels_match_profile(&plan, &roof);
+        assert_walls_partition(&skel, &roof);
+    }
+}
+
+/// A wall whose wavefront is split by two reflex vertices has a face the break
+/// crosses more than twice, so it comes apart into several lower and upper
+/// pieces. Each is emitted as its own panel rather than refused.
+#[test]
+fn a_break_cuts_a_split_face_into_several_pieces() {
+    let plan = Polygon::from_outer(&twin_spike()).unwrap();
+    let skel = skeleton(&plan).unwrap();
+
+    // At break 12 the base wall's face dips below and back three times.
+    let roof = Roof::mansard(&skel, 2.0, 12.0, 0.2).unwrap();
+    assert_panels_match_profile(&plan, &roof);
+    assert_walls_partition(&skel, &roof);
+
+    // The base wall (edge 0) carries more than the usual two panels.
+    let base = roof.panels_of(EdgeId(0)).count();
+    assert!(
+        base > 2,
+        "the split base wall should carry >2 panels, got {base}"
+    );
+}
+
+/// Sweeping the break over integer and fractional offsets on several concave
+/// shapes never refuses a valid mansard: every offset builds, and every result
+/// is a clean partition on the profile. Before the fix, integer offsets that
+/// coincided with a node offset returned `BreakSplitsPanel`.
+#[test]
+fn a_mansard_break_sweep_never_refuses_a_valid_panel() {
+    for (name, ring) in [
+        ("comb", comb()),
+        ("deep_comb", deep_comb()),
+        ("twin_spike", twin_spike()),
+    ] {
+        let plan = Polygon::from_outer(&ring).unwrap();
+        let skel = skeleton(&plan).unwrap();
+
+        let mut at = 4.0f32;
+        while at <= 40.0 {
+            let roof = Roof::mansard(&skel, 2.0, at, 0.2)
+                .unwrap_or_else(|e| panic!("{name}: break {at} should build, got {e}"));
+            assert_panels_match_profile(&plan, &roof);
+            assert_walls_partition(&skel, &roof);
+            at += 0.5;
+        }
+    }
+}
+
 // --- Gables: a zero limit freezes a wall ------------------------------------
 
 /// A limit of **zero** is how you gable a wall, and it composes with everything
