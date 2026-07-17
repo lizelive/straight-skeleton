@@ -6,23 +6,30 @@
 //! from one *event* to the next, where an event is any moment the wavefront's
 //! shape changes discontinuously.
 
-use alloc::collections::BinaryHeap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt;
 
-use crate::math::Vec2;
+use crate::math::{floor_i32, Vec2};
 use crate::polygon::{EdgeId, Polygon};
-use crate::skeleton::{Arc, Node, NodeId, NodeKind, Skeleton};
+use crate::skeleton::{Arc, Node, NodeId, NodeKind, ResidualLoop, Skeleton};
 use crate::Point;
 
-/// Tolerance for geometric comparisons, in coordinate units.
+/// Tolerance for the simulation's rate and time comparisons.
 ///
-/// Input coordinates are integers bounded by 32767, so `f32` resolves about
-/// `1e-11` there. `1e-7` sits far enough above the noise floor to absorb
-/// accumulated error, and far enough below 1 that it can never merge two
-/// distinct lattice points.
+/// This one is **not** a position tolerance, which is why it can be as tight as
+/// it is. It guards quantities that are `O(1)` by construction — closing rates
+/// and speeds, both dotted from unit vectors, and the times that come out of
+/// dividing by them. `f32` resolves about `1.2e-7` near 1, so `1e-4` sits some
+/// three orders of magnitude above the noise floor there while still being far
+/// too small to call a real approach a standstill.
+///
+/// Do not reach for this to compare positions. Coordinates run to 16383, where
+/// `f32` resolves only about `0.002` — coarser than `EPS` itself, so an `EPS`
+/// comparison between two positions out there is comparing noise. That is what
+/// [`MERGE_EPS`] is for.
 const EPS: f32 = 1e-4;
 
 /// Tolerance for treating two unit normals as parallel.
@@ -34,11 +41,26 @@ const PARALLEL_EPS: f32 = 1e-6;
 /// How close two wavefront vertices must be to count as arriving at the same
 /// place, and so be retired by a single vertex event.
 ///
-/// Looser than [`EPS`] because these positions are extrapolated from event
-/// times that are themselves computed, so the error in them compounds. Still
-/// six orders of magnitude below one lattice unit, so it cannot fuse vertices
-/// that genuinely belong apart.
+/// The position tolerance, and necessarily far looser than [`EPS`]. At the far
+/// corner of the coordinate range `f32` resolves about `0.002`, and these
+/// positions are not measured but *extrapolated* from event times that were
+/// themselves computed, so the error compounds on top of that. `1e-2` clears the
+/// worst-case resolution with room to spare.
+///
+/// It is still a hundred times smaller than one lattice unit, so it cannot fuse
+/// vertices that belong to distinct integer positions. It can fuse two genuine
+/// skeleton features closer than `1e-2` to each other — see `docs/DESIGN.md` on
+/// what `f32` costs.
 const MERGE_EPS: f32 = 1e-2;
+
+/// Side length of a [`Sim::node_grid`] cell, and its reciprocal.
+///
+/// Exactly [`MERGE_EPS`], which is the largest cell size for which a point's
+/// whole merge neighbourhood is guaranteed to lie within the 3x3 block of cells
+/// around it. A larger cell would need a wider block; a smaller one only spreads
+/// the same nodes over more cells.
+const CELL: f32 = MERGE_EPS;
+const INV_CELL: f32 = 1.0 / CELL;
 
 /// Why a skeleton could not be computed.
 #[derive(Clone, Debug, PartialEq)]
@@ -126,33 +148,39 @@ struct EdgeState {
     limit: f32,
 }
 
-impl EdgeState {
-    /// How far the edge has travelled by time `t`.
-    #[inline]
-    fn offset_at(&self, t: f32) -> f32 {
-        if t < self.limit {
-            t
-        } else {
-            self.limit
-        }
+/// How far an edge with this limit has travelled by time `t`.
+///
+/// Free-standing, and taking the limit rather than the edge, because the split
+/// scan reads its limits out of [`EdgeLines`] rather than an [`EdgeState`] and
+/// must apply the very same rule. Two copies of this rule that could drift apart
+/// is a bug waiting to happen; one that both call is not.
+#[inline]
+fn offset_at(limit: f32, t: f32) -> f32 {
+    if t < limit {
+        t
+    } else {
+        limit
     }
+}
 
-    /// The edge's speed at time `t`: 1 while it is still moving, 0 once it has
-    /// hit its limit. This is the single mechanism behind the constrained
-    /// transform.
+/// An edge's speed at time `t`: 1 while it is still moving, 0 once it has hit
+/// its limit. This is the single mechanism behind the constrained transform.
+///
+/// Free-standing for the same reason as [`offset_at`].
+#[inline]
+fn speed_at(limit: f32, t: f32) -> f32 {
+    if t < limit - EPS {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+impl EdgeState {
+    /// The edge's speed at time `t`.
     #[inline]
     fn speed_at(&self, t: f32) -> f32 {
-        if t < self.limit - EPS {
-            1.0
-        } else {
-            0.0
-        }
-    }
-
-    /// The supporting line's offset at time `t`.
-    #[inline]
-    fn c_at(&self, t: f32) -> f32 {
-        self.c + self.offset_at(t)
+        speed_at(self.limit, t)
     }
 }
 
@@ -192,16 +220,95 @@ struct WVertex {
     /// A vertex travels in a straight line, so it crosses any given edge's
     /// moving line at exactly one moment. If it was not on a live stretch of
     /// that edge at that moment, it never will be — the question is settled for
-    /// good, and the edge can be struck off. Almost always empty.
+    /// good, and the edge can be struck off.
     ///
-    /// Sorted so [`Sim::split_lower_bound`] can binary-search it. That is not
-    /// premature: the lookup sits inside a loop over every edge, so a linear
-    /// scan here makes one scan cost `O(n * rejections)` and drags the whole
-    /// simulation to `O(n^3)` on inputs that reject a lot.
+    /// Not the rare case it looks like: on star-like input roughly three
+    /// quarters of all split events are rejections, averaging about three per
+    /// reflex vertex. That is what [`SPLIT_FANOUT`] exists to absorb.
+    ///
+    /// Sorted so that striking an edge off can find its place, and dedupe, in
+    /// `O(log r)`. [`Sim::scan_for_split`] does not search this at all — it
+    /// strikes the whole list out of its scratch buffer in one `O(r)` pass,
+    /// rather than test membership per edge inside its inner loop.
     ///
     /// Cleared whenever the vertex's velocity changes, since that is a
     /// different trajectory and every answer has to be asked again.
     rejected: Vec<EdgeId>,
+    /// [`Sim::split_lower_bound`]'s answer for this vertex's current trajectory.
+    ///
+    /// The scan is the simulation's one non-constant step, and without this it
+    /// is repeated every time the vertex is rescheduled — which a vertex's
+    /// neighbours make it do several times over, for an answer that cannot have
+    /// changed. See [`SplitCache`].
+    split_cache: SplitCache,
+}
+
+/// How many split candidates one scan keeps.
+///
+/// A rejected candidate would otherwise cost a whole fresh scan to replace, and
+/// rejections are not the rare case: on star-like input about three quarters of
+/// all split events are rejections, averaging ~3 per reflex vertex. Keeping the
+/// earliest few turns one scan *per rejection* into one scan per handful.
+///
+/// 8 sits comfortably above that measured mean and costs 64 bytes on a vertex
+/// that already owns a heap allocation.
+///
+/// It is a cache size and nothing else: the value cannot change the skeleton,
+/// only how often the scan reruns. Setting it to 1 — which forces a rescan at
+/// every single rejection, the path this constant exists to avoid — leaves the
+/// whole test suite passing and every shape in the snapshot corpus identical to
+/// within `f32` noise. Worth rechecking that way after touching the cache.
+const SPLIT_FANOUT: usize = 8;
+
+/// A reflex vertex's split lower bounds, remembered across reschedules.
+///
+/// # Why the answer keeps
+///
+/// The crossing time solves `normal · p(t) = c_e(t)` along a fixed trajectory.
+/// Writing the distance to `e`'s moving line at time `u` as
+/// `d(u) = d(t0) + closing * (u - t0)`, with `closing` constant, the crossing
+/// time is
+///
+/// ```text
+///     t = u + d(u) / -closing = t0 - d(t0) / closing
+/// ```
+///
+/// — the `u` cancels. The answer does not depend on *when* it was asked, only on
+/// the trajectory it was asked about, so re-deriving it at each reschedule
+/// recomputes a constant. This is the same fact [`Sim::split_lower_bound`]
+/// already leans on to keep a split's timing independent of the rest of the
+/// wavefront; the cache only stops paying for it twice.
+///
+/// Because the crossing times are absolute and the candidates are consumed in
+/// increasing time order, a rejected candidate is always followed by the next
+/// one in the list — which is why keeping several is worth the room.
+///
+/// # When it stops being true
+///
+/// Only [`Sim::handle_speed_change`] can falsify it, and it does so for *every*
+/// vertex rather than only the ones it moves: a bound is a race between a vertex
+/// and a target edge's line, so an edge stopping changes `closing` for everyone
+/// aiming at it. [`Sim::handle_split_event`] also drops it when it strikes an
+/// edge off, since that answer is now stale by exclusion rather than by
+/// geometry.
+#[derive(Clone, Debug, PartialEq)]
+enum SplitCache {
+    /// Not asked yet for this trajectory.
+    Unknown,
+    /// Asked. `cands[next..len]` are the untried candidates, earliest first.
+    Ready {
+        /// Candidate crossing times and their edges, ascending.
+        cands: [(f32, EdgeId); SPLIT_FANOUT],
+        /// How many of `cands` are meaningful.
+        len: u8,
+        /// How many have already been tried and struck off.
+        next: u8,
+        /// Whether `cands` held *every* candidate rather than the earliest
+        /// [`SPLIT_FANOUT`] of them. Running out of a complete list means there
+        /// is genuinely nothing left to split; running out of a truncated one
+        /// only means it is time to scan again.
+        complete: bool,
+    },
 }
 
 impl WVertex {
@@ -253,16 +360,17 @@ enum EventKind {
 ///   from, each stamped with its *structural generation*. If one of them moves,
 ///   the timing is worthless.
 ///
-/// `refs` stays **O(1)** — at most the owner and its one neighbour — and that
-/// is what keeps the simulation from melting down. An earlier design also
-/// stamped the two endpoints of the edge a split was aimed at, which made a
-/// vertex's event depend on a part of the wavefront arbitrarily far away. Any
-/// event then invalidated events all over the polygon, each reschedule
-/// re-registered more dependencies, and the whole thing fed back on itself: a
-/// 132-vertex comb took 124ms and a 260-vertex one asked for 27GB.
+/// `refs` must stay **O(1)** — at most the owner and its one neighbour — and
+/// that is load-bearing rather than merely tidy. An event whose timing depends
+/// on a distant part of the wavefront is invalidated by anything that happens
+/// there; every reschedule then registers more such dependencies, and the
+/// invalidation feeds back on itself until the simulation is quadratic in its
+/// own bookkeeping.
 ///
-/// The way out is [`Sim::split_lower_bound`]: a split's *timing* never depended
-/// on those endpoints in the first place.
+/// What keeps `refs` small is [`Sim::split_lower_bound`] asking a weaker
+/// question than "where does this vertex split?", so that a split's timing
+/// depends on nothing but the vertex's own trajectory. Anything added here that
+/// stamps a third vertex should be assumed to reintroduce the feedback.
 #[derive(Clone, Copy, Debug)]
 struct Event {
     time: f32,
@@ -324,7 +432,9 @@ pub(crate) fn compute(
     let edges = build_edge_states(polygon, limits)?;
     let mut sim = Sim::new(polygon, edges)?;
     sim.run()?;
+    let residual = sim.collect_residual();
     let mut skel = sim.skeleton;
+    skel.residual = residual;
     skel.edge_nodes = polygon
         .edge_ids()
         .map(|e| {
@@ -382,10 +492,48 @@ fn build_edge_states(
     Ok(states)
 }
 
+/// The edges' lines, transposed into one array per component.
+///
+/// Identical data to [`EdgeState`]'s `normal`, `c` and `limit`, laid out for the
+/// one loop that reads all of them for every edge in turn:
+/// [`Sim::scan_for_split`], the simulation's only non-constant step. An array of
+/// `EdgeState` interleaves the fields that loop wants with `dir`, which it does
+/// not, so it reads 24 bytes per edge to use 16 and cannot be vectorised.
+/// Transposed, the loop is a flat pass over contiguous `f32`s.
+///
+/// [`EdgeState`] stays the source of truth; these are built from it once and
+/// never touched again, since an edge's line is fixed for the whole simulation.
+#[derive(Debug)]
+struct EdgeLines {
+    /// Inward unit normals, by component.
+    nx: Vec<f32>,
+    ny: Vec<f32>,
+    /// Original line offsets: `normal · x = c` at time 0.
+    c: Vec<f32>,
+    /// Distance limits, `INFINITY` when unconstrained.
+    limit: Vec<f32>,
+}
+
+impl EdgeLines {
+    fn new(edges: &[EdgeState]) -> Self {
+        EdgeLines {
+            nx: edges.iter().map(|e| e.normal.x).collect(),
+            ny: edges.iter().map(|e| e.normal.y).collect(),
+            c: edges.iter().map(|e| e.c).collect(),
+            limit: edges.iter().map(|e| e.limit).collect(),
+        }
+    }
+}
+
 /// The simulation's mutable state.
 struct Sim<'a> {
     polygon: &'a Polygon,
     edges: Vec<EdgeState>,
+    /// [`Sim::edges`], transposed for the split scan.
+    lines: EdgeLines,
+    /// Scratch for the split scan's first pass, one slot per edge. Held here so
+    /// the scan does not allocate on every call.
+    scratch: Vec<f32>,
     verts: Vec<WVertex>,
     queue: BinaryHeap<Event>,
     skeleton: Skeleton,
@@ -395,12 +543,31 @@ struct Sim<'a> {
     /// coarse to decide whether a vertex is standing on its own node. This
     /// keeps the unnarrowed value for the simulation's own use.
     node_pos: Vec<Vec2>,
+    /// Interior nodes bucketed by [`CELL`]-sized cell, so [`Sim::node_at`] can
+    /// find the node at a point without scanning every node there is.
+    ///
+    /// Boundary nodes are never merged into, so they are never inserted.
+    node_grid: BTreeMap<(i32, i32), Vec<u32>>,
     /// Vertices needing a fresh event before the simulation may advance.
     ///
     /// Only ever holds a vertex that has just moved or been relinked, and that
     /// vertex's `prev` — whose edge event is computed from it. Both are O(1) per
     /// event, which is the whole point.
+    ///
+    /// Deduplicated by [`Sim::in_dirty`]: one event routinely reaches the same
+    /// vertex several ways, and rescheduling it once per route would queue an
+    /// event per route and immediately strand all but the last.
     dirty: Vec<usize>,
+    /// Whether a vertex is already in [`Sim::dirty`], parallel to `verts`.
+    in_dirty: Vec<bool>,
+    /// `edge_verts[e]` lists every wavefront vertex ever created with `right ==
+    /// e` — that is, the owners of `e`'s wavefront stretches.
+    ///
+    /// A vertex's `left` and `right` are fixed for its whole life, so an entry
+    /// never becomes wrong, only inactive. Ids are appended as the arena grows
+    /// and so stay ascending, which is what lets [`Sim::live_stretch_at`] return
+    /// the same stretch a scan of the whole arena in index order would.
+    edge_verts: Vec<Vec<u32>>,
     /// Current simulation time, monotonically non-decreasing.
     now: f32,
 }
@@ -411,12 +578,14 @@ impl<'a> Sim<'a> {
         let mut skeleton = Skeleton::default();
         let mut verts = Vec::with_capacity(n * 2);
         let mut node_pos: Vec<Vec2> = Vec::with_capacity(n * 2);
+        let mut edge_verts: Vec<Vec<u32>> = vec![Vec::new(); polygon.edge_count()];
 
         // One wavefront vertex and one boundary node per input vertex.
         for v in polygon.vertex_ids() {
             let left = polygon.prev_vertex(v).outgoing_edge();
             let right = v.outgoing_edge();
             let pos = polygon.vertex(v).to_vec2();
+            edge_verts[right.0 as usize].push(verts.len() as u32);
 
             let node = NodeId(skeleton.nodes.len() as u32);
             node_pos.push(pos);
@@ -441,15 +610,21 @@ impl<'a> Sim<'a> {
                 gen: 0,
                 evt: 0,
                 rejected: Vec::new(),
+                split_cache: SplitCache::Unknown,
             });
         }
 
         let mut sim = Sim {
             polygon,
+            lines: EdgeLines::new(&edges),
+            scratch: vec![0.0; edges.len()],
             edges,
+            in_dirty: vec![false; verts.len()],
+            edge_verts,
             verts,
             queue: BinaryHeap::new(),
             node_pos,
+            node_grid: BTreeMap::new(),
             dirty: Vec::new(),
             skeleton,
             now: 0.0,
@@ -575,6 +750,7 @@ impl<'a> Sim<'a> {
             // Nothing may advance past this point until every vertex whose
             // event the last one invalidated has a fresh one queued.
             while let Some(i) = self.dirty.pop() {
+                self.in_dirty[i] = false;
                 if self.verts[i].active {
                     self.schedule(i)?;
                 }
@@ -608,9 +784,23 @@ impl<'a> Sim<'a> {
     /// [`Sim::split_lower_bound`].
     fn touch(&mut self, i: usize) {
         self.verts[i].gen = self.verts[i].gen.wrapping_add(1);
-        self.dirty.push(i);
+        self.mark(i);
         let prev = self.verts[i].prev;
-        self.dirty.push(prev);
+        self.mark(prev);
+    }
+
+    /// Queues a vertex for rescheduling once the current event is finished.
+    ///
+    /// Idempotent within an event. That matters for more than tidiness: a single
+    /// event reaches the same vertex through several routes — as the merged
+    /// vertex, as a neighbour's `prev`, and as an explicit mark — and scheduling
+    /// it once per route queues one event per route, of which only the last
+    /// survives. The rest sit in the heap until they are popped and discarded.
+    fn mark(&mut self, i: usize) {
+        if !self.in_dirty[i] {
+            self.in_dirty[i] = true;
+            self.dirty.push(i);
+        }
     }
 
     /// Computes and queues the next event for vertex `i`.
@@ -700,55 +890,166 @@ impl<'a> Sim<'a> {
     /// Deciding here whether the landing is on a live stretch is what would ruin
     /// that. It would need the current endpoints of the edge, making this
     /// vertex's event depend on two vertices arbitrarily far away, so that any
-    /// event anywhere invalidated events everywhere. That is what the earlier
-    /// design did, and it cost `O(n^5)`.
+    /// event anywhere invalidated events everywhere — see [`Event`] for why that
+    /// feedback is fatal rather than merely wasteful.
     ///
     /// The question is instead settled in [`Sim::handle_split_event`], when the
     /// event is popped — by which point it is not a prediction at all.
     ///
     /// Scans every input edge, so `O(n)`; it is the only non-constant step left
-    /// in the simulation.
-    fn split_lower_bound(&self, i: usize) -> Option<Event> {
-        let v = &self.verts[i];
-        let p_now = v.at(self.now);
-        let mut best: Option<(f32, EdgeId)> = None;
-
-        for k in 0..self.edges.len() {
-            let eo = EdgeId(k as u16);
-            // A vertex cannot split the edges it rides on, nor one already
-            // ruled out. `rejected` is sorted, so this stays O(log r).
-            if eo == v.left || eo == v.right || v.rejected.binary_search(&eo).is_ok() {
-                continue;
-            }
-
-            let e = &self.edges[k];
-            let w = e.speed_at(self.now);
-
-            // Distance to the moving line, and the rate it closes at. The
-            // interior is on the +normal side, so `dist` starts non-negative.
-            let dist = e.normal.dot(p_now) - e.c_at(self.now);
-            let closing = e.normal.dot(v.vel) - w;
-            if closing >= -EPS {
-                continue; // v never reaches this line
-            }
-            let dt = dist / -closing;
-            if !dt.is_finite() || dt < -EPS {
-                continue;
-            }
-            let t = self.now + dt.max(0.0);
-
-            if best.map_or(true, |(bt, _)| t < bt) {
-                best = Some((t, eo));
-            }
+    /// in the simulation. [`SplitCache`] is what keeps it from being repeated
+    /// for an answer that cannot have changed.
+    fn split_lower_bound(&mut self, i: usize) -> Option<Event> {
+        if matches!(self.verts[i].split_cache, SplitCache::Unknown) {
+            let c = self.scan_for_split(i);
+            self.verts[i].split_cache = c;
         }
 
-        best.map(|(t, edge)| Event::new(t, EventKind::Split { v: i, edge }, (i, 0), &[(i, v.gen)]))
+        let SplitCache::Ready {
+            ref cands,
+            len,
+            next,
+            complete,
+        } = self.verts[i].split_cache
+        else {
+            unreachable!("just filled")
+        };
+
+        if next >= len {
+            if complete {
+                return None; // every candidate is spent; this vertex splits nothing
+            }
+            // The list was truncated, so there may be later candidates the scan
+            // never kept. Ask again, now that the tried ones are struck off.
+            let c = self.scan_for_split(i);
+            self.verts[i].split_cache = c;
+            return self.split_lower_bound(i);
+        }
+
+        let (t_cross, edge) = cands[next as usize];
+        let v = &self.verts[i];
+        // The crossing time is absolute, and nothing may be scheduled into the
+        // past; a bound already behind the clock fires at once.
+        Some(Event::new(
+            t_cross.max(self.now),
+            EventKind::Split { v: i, edge },
+            (i, 0),
+            &[(i, v.gen)],
+        ))
+    }
+
+    /// The scan behind [`Sim::split_lower_bound`]: the earliest
+    /// [`SPLIT_FANOUT`] moments `i` reaches any input edge's moving line.
+    ///
+    /// Two passes, because they want opposite things. Computing a crossing time
+    /// is the same handful of arithmetic for every edge with no reason to
+    /// branch, so the first pass does exactly that over [`EdgeLines`]' flat
+    /// arrays and writes `INFINITY` where there is no crossing — no `continue`,
+    /// nothing for the compiler to trip over, one straight vectorisable run.
+    /// Picking the earliest few is all branching and no arithmetic, so it gets
+    /// its own pass, over a contiguous `f32` buffer.
+    fn scan_for_split(&mut self, i: usize) -> SplitCache {
+        let n = self.edges.len();
+        let (p_now, vel) = {
+            let v = &self.verts[i];
+            (v.at(self.now), v.vel)
+        };
+        let now = self.now;
+
+        // Borrowed out so the pass below can write `scratch` while reading
+        // `lines`; handed straight back.
+        let mut scratch = core::mem::take(&mut self.scratch);
+        scratch.resize(n, 0.0);
+        let l = &self.lines;
+
+        // Zipped rather than indexed: equal-length slices walked together carry
+        // no bounds checks, which is the difference between this pass
+        // vectorising and not.
+        let pass = scratch[..n]
+            .iter_mut()
+            .zip(&l.nx[..n])
+            .zip(&l.ny[..n])
+            .zip(&l.c[..n])
+            .zip(&l.limit[..n]);
+
+        for ((((out, &nx), &ny), &c), &limit) in pass {
+            // The edge's line at `now`, and the rate it closes on the vertex.
+            // Interior is on the +normal side, so `dist` starts non-negative.
+            // Both selects compile to branchless moves, so they cost the pass
+            // nothing even in the common case where no limits are set at all.
+            let dist = nx * p_now.x + ny * p_now.y - (c + offset_at(limit, now));
+            let closing = nx * vel.x + ny * vel.y - speed_at(limit, now);
+            let dt = dist / -closing;
+
+            // `closing >= -EPS` means it never reaches this line at all;
+            // `dt < -EPS` means it already passed it. A vertex travels in a
+            // straight line, so either way the question is closed for good.
+            let reachable = closing < -EPS && dt.is_finite() && dt >= -EPS;
+            // Absolute, and deliberately not clamped to `now`: this is cached
+            // and read back at later times, so it must stay the trajectory's own
+            // answer rather than one relative to the clock that happened to ask.
+            *out = if reachable { now + dt } else { f32::INFINITY };
+        }
+
+        // A vertex cannot split the edges it rides on, nor any already ruled
+        // out. Struck out here rather than tested inside the pass above, where
+        // the lookups would serialise it.
+        let v = &self.verts[i];
+        scratch[v.left.0 as usize] = f32::INFINITY;
+        scratch[v.right.0 as usize] = f32::INFINITY;
+        for &r in &v.rejected {
+            scratch[r.0 as usize] = f32::INFINITY;
+        }
+
+        let mut cands = [(f32::INFINITY, EdgeId(0)); SPLIT_FANOUT];
+        let mut len = 0usize;
+        let mut total = 0usize;
+
+        for (k, &t) in scratch[..n].iter().enumerate() {
+            if t == f32::INFINITY {
+                continue;
+            }
+            total += 1;
+            if len == SPLIT_FANOUT && t >= cands[SPLIT_FANOUT - 1].0 {
+                continue; // later than every one already kept
+            }
+            // Insertion sort into an 8-slot array. `>` rather than `>=` keeps
+            // equal times in edge order, so the pick stays deterministic when
+            // several edges are reached at the same instant.
+            let mut p = len.min(SPLIT_FANOUT - 1);
+            while p > 0 && cands[p - 1].0 > t {
+                cands[p] = cands[p - 1];
+                p -= 1;
+            }
+            cands[p] = (t, EdgeId(k as u16));
+            len = (len + 1).min(SPLIT_FANOUT);
+        }
+
+        self.scratch = scratch;
+        SplitCache::Ready {
+            cands,
+            len: len as u8,
+            next: 0,
+            complete: total <= SPLIT_FANOUT,
+        }
+    }
+
+    /// The grid cell a position falls in.
+    #[inline]
+    fn cell_of(pos: Vec2) -> (i32, i32) {
+        (floor_i32(pos.x * INV_CELL), floor_i32(pos.y * INV_CELL))
     }
 
     /// Adds a node to the skeleton.
     fn push_node(&mut self, pos: Vec2, t: f32, kind: NodeKind, sources: Vec<EdgeId>) -> NodeId {
         let id = NodeId(self.skeleton.nodes.len() as u32);
         self.node_pos.push(pos);
+        if !matches!(kind, NodeKind::Boundary(_)) {
+            self.node_grid
+                .entry(Self::cell_of(pos))
+                .or_default()
+                .push(id.0);
+        }
         self.skeleton.nodes.push(Node {
             position: Point::from_vec2_rounded(pos),
             exact: [pos.x, pos.y],
@@ -875,6 +1176,7 @@ impl<'a> Sim<'a> {
             gen: 0,
             evt: 0,
             rejected: Vec::new(),
+            split_cache: SplitCache::Unknown,
         });
         self.verts[iprev].next = merged;
         self.verts[inext].prev = merged;
@@ -889,9 +1191,9 @@ impl<'a> Sim<'a> {
 
         self.verts[merged].vel = self.velocity_of(merged, t)?;
 
-        self.schedule(merged)?;
-        self.schedule(iprev)?;
-        self.schedule(inext)?;
+        self.mark(merged);
+        self.mark(iprev);
+        self.mark(inext);
         Ok(())
     }
 
@@ -1030,6 +1332,7 @@ impl<'a> Sim<'a> {
                 gen: 0,
                 evt: 0,
                 rejected: Vec::new(),
+                split_cache: SplitCache::Unknown,
             });
             self.verts[lo].next = nv;
             self.verts[hi].prev = nv;
@@ -1043,9 +1346,9 @@ impl<'a> Sim<'a> {
             }
 
             self.verts[nv].vel = self.velocity_of(nv, t)?;
-            self.schedule(nv)?;
-            self.schedule(lo)?;
-            self.schedule(hi)?;
+            self.mark(nv);
+            self.mark(lo);
+            self.mark(hi);
             return Ok(());
         }
     }
@@ -1071,17 +1374,36 @@ impl<'a> Sim<'a> {
     /// so reusing one is exact, not an approximation.
     ///
     /// Boundary nodes are never reused: each belongs to a named input vertex.
+    ///
+    /// Only the 3x3 block of grid cells around `pos` is searched. A cell is
+    /// [`MERGE_EPS`] across, so nothing within [`MERGE_EPS`] of `pos` can lie
+    /// outside that block — the answer is the same one a scan of every node
+    /// would give, including which node is picked when several are in range.
     fn node_at(&mut self, pos: Vec2, t: f32, kind: NodeKind, sources: Vec<EdgeId>) -> NodeId {
-        for i in 0..self.node_pos.len() {
-            if !self.skeleton.nodes[i].is_boundary()
-                && (self.node_pos[i] - pos).length() <= MERGE_EPS
-            {
-                let n = &mut self.skeleton.nodes[i];
-                n.sources.extend(sources);
-                n.sources.sort_unstable();
-                n.sources.dedup();
-                return NodeId(i as u32);
+        let (cx, cy) = Self::cell_of(pos);
+        let mut found: Option<u32> = None;
+        for gx in cx - 1..=cx + 1 {
+            for gy in cy - 1..=cy + 1 {
+                let Some(bucket) = self.node_grid.get(&(gx, gy)) else {
+                    continue;
+                };
+                for &i in bucket {
+                    // Squared, to keep a square root out of the inner loop.
+                    if (self.node_pos[i as usize] - pos).length_squared() <= MERGE_EPS * MERGE_EPS {
+                        // Lowest id wins, matching what a scan in node order
+                        // returned when several nodes are within range.
+                        found = Some(found.map_or(i, |b| b.min(i)));
+                    }
+                }
             }
+        }
+
+        if let Some(i) = found {
+            let n = &mut self.skeleton.nodes[i as usize];
+            n.sources.extend(sources);
+            n.sources.sort_unstable();
+            n.sources.dedup();
+            return NodeId(i);
         }
         self.push_node(pos, t, kind, sources)
     }
@@ -1099,9 +1421,11 @@ impl<'a> Sim<'a> {
     /// have been a guess about a future that later events could change.
     fn live_stretch_at(&self, edge: EdgeId, pos: Vec2, t: f32) -> Option<usize> {
         let e = &self.edges[edge.0 as usize];
-        for j in 0..self.verts.len() {
+        // Only this edge's own stretch owners, rather than the whole arena.
+        for &j in &self.edge_verts[edge.0 as usize] {
+            let j = j as usize;
             let a = &self.verts[j];
-            if !a.active || a.right != edge {
+            if !a.active {
                 continue;
             }
             let b = &self.verts[a.next];
@@ -1135,11 +1459,24 @@ impl<'a> Sim<'a> {
             // and so meets this line only once: the question is closed for good,
             // and the edge can be struck off before asking for the next
             // candidate.
-            let rejected = &mut self.verts[iv].rejected;
-            if let Err(at) = rejected.binary_search(&eo) {
-                rejected.insert(at, eo); // keep it sorted for the binary search
+            let v = &mut self.verts[iv];
+            if let Err(at) = v.rejected.binary_search(&eo) {
+                v.rejected.insert(at, eo); // keep it sorted for the binary search
             }
-            self.schedule(iv)?;
+            // The bound just struck off is the one the cache was handing out, so
+            // step past it. The next candidate is already known unless the scan
+            // truncated, which is the whole point of keeping more than one.
+            match &mut v.split_cache {
+                SplitCache::Ready {
+                    cands, len, next, ..
+                } if *next < *len && cands[*next as usize].1 == eo => {
+                    *next += 1;
+                }
+                // The struck-off edge was not the one on offer, so the cache is
+                // about something else and cannot be stepped past coherently.
+                c => *c = SplitCache::Unknown,
+            }
+            self.mark(iv);
             return Ok(());
         };
 
@@ -1175,6 +1512,7 @@ impl<'a> Sim<'a> {
             gen: 0,
             evt: 0,
             rejected: Vec::new(),
+            split_cache: SplitCache::Unknown,
         });
         let v2 = self.spawn(WVertex {
             prev: iopp,
@@ -1189,6 +1527,7 @@ impl<'a> Sim<'a> {
             gen: 0,
             evt: 0,
             rejected: Vec::new(),
+            split_cache: SplitCache::Unknown,
         });
 
         self.verts[v_prev].next = v1;
@@ -1217,9 +1556,7 @@ impl<'a> Sim<'a> {
         }
 
         for i in [v1, v2, v_prev, ib, iopp, v_next] {
-            if self.verts[i].active {
-                self.schedule(i)?;
-            }
+            self.mark(i);
         }
         Ok(())
     }
@@ -1227,12 +1564,16 @@ impl<'a> Sim<'a> {
     /// An edge hit its distance limit and stopped.
     ///
     /// Every active vertex's trajectory can bend here, so each one gets a node
-    /// (a kink in its arc) and a fresh velocity. Rescheduling *everything* is
-    /// heavy-handed — O(n^2) per stop — but a speed change also invalidates
-    /// split events aimed at the stopped edge from elsewhere in the wavefront,
-    /// and sorting out exactly which is a subtle bookkeeping problem for no
-    /// real gain: a polygon has at most one stop per distinct limit, and the
-    /// common cases (no limits, or one uniform limit) cost zero or one pass.
+    /// (a kink in its arc) and a fresh velocity, and every split bound in the
+    /// wavefront is invalidated — a bound is a race against a target edge's
+    /// line, and one of those lines just stopped.
+    ///
+    /// Touching *everything* is heavy-handed, and deliberately so. Working out
+    /// precisely which vertices still had valid bounds would be subtle
+    /// bookkeeping guarding the invariant that keeps the whole simulation
+    /// correct, for no real gain: a polygon has at most one stop per distinct
+    /// limit, and the common cases — no limits at all, or one uniform limit —
+    /// run this zero or one times.
     fn handle_speed_change(&mut self, _edge: EdgeId, t: f32) -> Result<(), SkeletonError> {
         let n = self.verts.len();
         for i in 0..n {
@@ -1265,14 +1606,74 @@ impl<'a> Sim<'a> {
                 // path this vertex is no longer on, so ask again.
                 v.rejected.clear();
             }
+            // Unconditional, unlike the above. A split bound is a race between a
+            // vertex and a *target* edge's line, so the edge that just stopped
+            // changes the answer for every vertex aiming at it — including the
+            // ones standing still, whose own velocity did not move.
+            self.verts[i].split_cache = SplitCache::Unknown;
             self.touch(i);
         }
         Ok(())
     }
 
+    /// The wavefront loops still standing once the queue has run dry.
+    ///
+    /// # Why anything is left
+    ///
+    /// A moving wavefront always has a next event: its edges are closing on one
+    /// another, so something collapses eventually. The only way a loop outlives
+    /// the queue is if every vertex on it has stopped — which needs every edge
+    /// around it to have hit its limit, since [`Sim::velocity_of`] only returns
+    /// zero when both its edges have. So this is empty for a plain skeleton, and
+    /// non-empty exactly where limits bound hard enough to freeze a whole loop.
+    ///
+    /// (The other way to sit still is a needle's antiparallel pair, but
+    /// [`Sim::resolve_needle`] retires those on the spot rather than leaving
+    /// them for the queue to not deliver.)
+    ///
+    /// Each surviving vertex's `node` is already the node its arc stopped at, so
+    /// there is nothing to compute here: the loops are read straight off the
+    /// `prev`/`next` links, which have kept the input's winding all along.
+    fn collect_residual(&self) -> Vec<ResidualLoop> {
+        let mut seen = vec![false; self.verts.len()];
+        let mut loops = Vec::new();
+
+        for start in 0..self.verts.len() {
+            if seen[start] || !self.verts[start].active {
+                continue;
+            }
+
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            let mut i = start;
+            loop {
+                seen[i] = true;
+                nodes.push(self.verts[i].node);
+                // The wavefront edge leaving this vertex belongs to `right`, so
+                // the segment from `nodes[k]` to `nodes[k + 1]` is `right`'s.
+                edges.push(self.verts[i].right);
+                i = self.verts[i].next;
+                if i == start || seen[i] || !self.verts[i].active {
+                    break;
+                }
+            }
+
+            // A loop needs three corners to enclose anything. Anything shorter
+            // is a remnant the simulation should have retired, so drop it rather
+            // than hand out a degenerate polygon.
+            if nodes.len() >= 3 {
+                loops.push(ResidualLoop { nodes, edges });
+            }
+        }
+        loops
+    }
+
     fn spawn(&mut self, v: WVertex) -> usize {
+        let id = self.verts.len();
+        self.edge_verts[v.right.0 as usize].push(id as u32);
         self.verts.push(v);
-        self.verts.len() - 1
+        self.in_dirty.push(false);
+        id
     }
 
     fn deactivate(&mut self, i: usize) {
@@ -1308,34 +1709,49 @@ mod tests {
     }
 
     #[test]
-    fn edge_state_speed_drops_at_the_limit() {
-        let e = EdgeState {
-            dir: Vec2::new(1.0, 0.0),
-            normal: Vec2::new(0.0, 1.0),
-            c: 0.0,
-            limit: 3.0,
-        };
-        assert_eq!(e.speed_at(0.0), 1.0);
-        assert_eq!(e.speed_at(2.9), 1.0);
-        assert_eq!(e.speed_at(3.0), 0.0);
-        assert_eq!(e.speed_at(9.0), 0.0);
+    fn edge_speed_drops_at_the_limit() {
+        assert_eq!(speed_at(3.0, 0.0), 1.0);
+        assert_eq!(speed_at(3.0, 2.9), 1.0);
+        assert_eq!(speed_at(3.0, 3.0), 0.0);
+        assert_eq!(speed_at(3.0, 9.0), 0.0);
 
-        assert_eq!(e.offset_at(1.0), 1.0);
-        assert_eq!(e.offset_at(3.0), 3.0);
-        assert_eq!(e.offset_at(9.0), 3.0, "offset clamps at the limit");
-        assert_eq!(e.c_at(9.0), 3.0);
+        assert_eq!(offset_at(3.0, 1.0), 1.0);
+        assert_eq!(offset_at(3.0, 3.0), 3.0);
+        assert_eq!(offset_at(3.0, 9.0), 3.0, "offset clamps at the limit");
     }
 
     #[test]
     fn unconstrained_edge_never_stops() {
-        let e = EdgeState {
-            dir: Vec2::new(1.0, 0.0),
-            normal: Vec2::new(0.0, 1.0),
-            c: 0.0,
-            limit: f32::INFINITY,
-        };
-        assert_eq!(e.speed_at(1e9), 1.0);
-        assert_eq!(e.offset_at(1e9), 1e9);
+        assert_eq!(speed_at(f32::INFINITY, 1e9), 1.0);
+        assert_eq!(offset_at(f32::INFINITY, 1e9), 1e9);
+    }
+
+    /// `EdgeState` and `EdgeLines` hold the same limits and must apply them the
+    /// same way — the split scan reads one, the velocity solve the other, and a
+    /// disagreement between them would be a wavefront that moved at one speed
+    /// and was predicted at another.
+    #[test]
+    fn edge_state_and_edge_lines_agree() {
+        let states: Vec<EdgeState> = [3.0, f32::INFINITY, 0.0]
+            .iter()
+            .map(|&limit| EdgeState {
+                dir: Vec2::new(1.0, 0.0),
+                normal: Vec2::new(0.0, 1.0),
+                c: 7.0,
+                limit,
+            })
+            .collect();
+        let lines = EdgeLines::new(&states);
+
+        for (k, e) in states.iter().enumerate() {
+            assert_eq!(lines.nx[k], e.normal.x);
+            assert_eq!(lines.ny[k], e.normal.y);
+            assert_eq!(lines.c[k], e.c);
+            assert_eq!(lines.limit[k], e.limit);
+            for t in [0.0f32, 1.0, 2.9, 3.0, 9.0, 1e9] {
+                assert_eq!(speed_at(lines.limit[k], t), e.speed_at(t));
+            }
+        }
     }
 
     #[test]
@@ -1353,6 +1769,7 @@ mod tests {
             gen: 0,
             evt: 0,
             rejected: Vec::new(),
+            split_cache: SplitCache::Unknown,
         };
         assert_eq!(v.at(1.0), Vec2::new(1.0, 2.0));
         assert_eq!(v.at(3.0), Vec2::new(7.0, 0.0));

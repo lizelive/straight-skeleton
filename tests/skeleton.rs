@@ -580,6 +580,92 @@ fn each_boundary_node_emits_exactly_one_arc() {
     }
 }
 
+/// A comb: many teeth, so many reflex vertices, and — because the teeth are
+/// identical and evenly spaced — whole batches of events firing at the very same
+/// instant. That simultaneity is what makes it worth checking rather than just
+/// timing: it is the input most likely to expose an ordering-dependent bug.
+fn comb(teeth: usize) -> Vec<Point> {
+    let mut pts = vec![Point::new(0, 0)];
+    for i in 0..teeth {
+        let x = (i as i16) * 20;
+        pts.push(Point::new(x + 5, 0));
+        pts.push(Point::new(x + 5, 300));
+        pts.push(Point::new(x + 15, 300));
+        pts.push(Point::new(x + 15, 0));
+    }
+    pts.push(Point::new(teeth as i16 * 20, 0));
+    pts.push(Point::new(teeth as i16 * 20, -40));
+    pts.push(Point::new(0, -40));
+    pts
+}
+
+/// A star with alternating radii, jittered so that — unlike the comb — almost no
+/// two events coincide. The two shapes fail in opposite ways, so both are here.
+fn jittered_star(n: usize) -> Vec<Point> {
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 33) as f64 / (1u64 << 31) as f64
+    };
+    (0..n)
+        .map(|i| {
+            let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+            let r = if i % 2 == 0 {
+                3000.0 + next() * 1000.0
+            } else {
+                1200.0 + next() * 400.0
+            };
+            Point::new((r * a.cos()) as i16, (r * a.sin()) as i16)
+        })
+        .collect()
+}
+
+/// The shapes the benchmark uses are the ones with hundreds of reflex vertices,
+/// splits, and needles — by far the most demanding input the crate is run on —
+/// and they were previously only ever timed, never checked. A skeleton that is
+/// fast and wrong still passes a benchmark.
+#[test]
+fn bench_shapes_satisfy_every_invariant() {
+    for teeth in [1usize, 2, 5, 33] {
+        let poly = Polygon::from_outer(&comb(teeth)).unwrap();
+        let skel = skeleton(&poly).unwrap();
+        check_invariants(&poly, &skel, TOL);
+        check_every_face_closes(&poly, &skel);
+    }
+    for n in [16usize, 64, 128, 256] {
+        let poly = Polygon::from_outer(&jittered_star(n)).unwrap();
+        let skel = skeleton(&poly).unwrap();
+        // Coordinates run to ~4000 here, where `f32` resolves about 5e-4, and
+        // the star's near-degenerate spikes let that accumulate.
+        check_invariants(&poly, &skel, 0.1);
+        check_every_face_closes(&poly, &skel);
+    }
+}
+
+/// Every input edge's face walks and closes.
+///
+/// This is a much stronger claim than the per-node and per-arc checks, and it is
+/// the one that pins the *combinatorics* rather than the geometry. Walking a
+/// face follows the arcs naming an edge as a source from one end of that edge
+/// around to the other; it only closes if those arcs form exactly one loop. A
+/// node placed on the wrong side of a degenerate tie, or an arc joined to the
+/// wrong neighbour, leaves the walk unable to get home even though every
+/// individual node is still equidistant from the edges it names.
+fn check_every_face_closes(poly: &Polygon, skel: &straight_skeleton::Skeleton) {
+    let faces = skel.faces().unwrap_or_else(|| {
+        panic!(
+            "some face of a {}-vertex polygon does not close",
+            poly.vertex_count()
+        )
+    });
+    assert_eq!(faces.len(), poly.edge_count(), "one face per input edge");
+    for (i, f) in faces.iter().enumerate() {
+        assert!(f.len() >= 3, "face {i} is degenerate: {} corners", f.len());
+    }
+}
+
 #[test]
 fn arc_sources_always_name_two_distinct_edges() {
     for pts in [rect(20, 10), l_shape(), plus_shape()] {

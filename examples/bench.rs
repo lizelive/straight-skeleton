@@ -12,21 +12,31 @@ use std::time::Instant;
 use straight_skeleton::{skeleton, Point, Polygon};
 
 fn main() {
-    println!("{:>7}  {:>7}  {:>12}  {:>6}", "n", "reflex", "time", "n^k");
+    println!(
+        "{:>7}  {:>7}  {:>12}  {:>6}  {:>12}",
+        "n", "reflex", "skeleton", "n^k", "validate"
+    );
 
     for shape in ["zigzag-comb", "random-star", "convex-ngon"] {
         println!("\n--- {shape}");
         let mut prev: Option<(usize, f64)> = None;
 
-        for &n in &[16usize, 32, 64, 128, 256, 512, 1024] {
+        // The upper end is bounded by the coordinate cap, not by patience: a
+        // comb of `n` vertices is `5n` wide, so it stops fitting past ~3200.
+        for &n in &[16usize, 32, 64, 128, 256, 512, 1024, 2048, 3200] {
             let pts = match shape {
                 "zigzag-comb" => comb(n),
                 "random-star" => star(n),
                 _ => convex(n),
             };
+            // Timed too: `Polygon::new` validates, and validation has its own
+            // complexity. Leaving it outside the clock would report the crate as
+            // faster than any caller can actually get a skeleton.
+            let v0 = Instant::now();
             let Ok(poly) = Polygon::from_outer(&pts) else {
                 continue;
             };
+            let vt = v0.elapsed().as_secs_f64();
             let reflex = poly.vertex_ids().filter(|&v| poly.is_reflex(v)).count();
 
             let t0 = Instant::now();
@@ -43,11 +53,12 @@ fn main() {
                 _ => "-".to_string(),
             };
             println!(
-                "{:>7}  {:>7}  {:>10.2}ms  {:>6}",
+                "{:>7}  {:>7}  {:>10.2}ms  {:>6}  {:>10.2}ms",
                 poly.vertex_count(),
                 reflex,
                 dt * 1000.0,
-                k
+                k,
+                vt * 1000.0
             );
             prev = Some((n, dt));
 

@@ -183,6 +183,135 @@ impl Arc {
     }
 }
 
+/// A loop of the wavefront that stopped rather than collapsing: the offset
+/// polygon a [`skeleton_constrained`] leaves behind.
+///
+/// # What it is
+///
+/// The wavefront of a plain [`skeleton`] always shrinks away to nothing — that
+/// is what it means for the skeleton to be finished. Limits change that. Once
+/// every edge around some loop has stopped, the loop stops too, and simply
+/// stays there. What it stays as is the input polygon offset inward by the
+/// limit: the *flat* left in the middle of a truncated roof.
+///
+/// So a constrained skeleton is not only the stubs reaching in from the
+/// boundary. It is those stubs **and** the outline they stop on, and this is
+/// that outline.
+///
+/// ```text
+///     +-------------------------+        +-------------------------+
+///     |                         |        | \                     / |
+///     |                         |        |   +-----------------+   |
+///     |                         |   ->   |   |    residual     |   |
+///     |                         |        |   +-----------------+   |
+///     |                         |        | /                     \ |
+///     +-------------------------+        +-------------------------+
+///        every edge limited                the arcs stop at the limit,
+///                                          and this is where they stop
+/// ```
+///
+/// # Why it is not made of [`Arc`]s
+///
+/// Because it would be a lie about what an `Arc` is. Every arc bisects the
+/// supporting lines of exactly two input edges, which is what makes
+/// [`Arc::sources`] meaningful and what the whole provenance story rests on. A
+/// residual segment is *parallel* to one input edge and belongs to it alone.
+/// Putting one in `arcs` would break the invariant every consumer of `sources`
+/// relies on, so it lives here with the shape it actually has: each segment
+/// names the one edge it came from.
+///
+/// # Winding
+///
+/// Inherited from the input, so the polygon's interior stays on the left of
+/// every segment: the loop around the outer boundary runs counter-clockwise,
+/// and a loop around a hole runs clockwise.
+///
+/// [`skeleton`]: crate::skeleton
+/// [`skeleton_constrained`]: crate::skeleton_constrained
+///
+/// # Examples
+///
+/// ```
+/// use straight_skeleton::{skeleton, skeleton_constrained, Point, Polygon};
+///
+/// let square = Polygon::from_outer(&[
+///     Point::new(0, 0), Point::new(100, 0), Point::new(100, 100), Point::new(0, 100),
+/// ])?;
+///
+/// // Stop every edge at 20: what is left is the 60x60 square in the middle.
+/// let skel = skeleton_constrained(&square, &[20.0; 4])?;
+/// let flat = &skel.residual()[0];
+/// assert_eq!(flat.len(), 4);
+///
+/// let mut corners: Vec<Point> = flat.nodes.iter().map(|&n| skel.node(n).position).collect();
+/// corners.sort();
+/// assert_eq!(corners, vec![
+///     Point::new(20, 20), Point::new(20, 80), Point::new(80, 20), Point::new(80, 80),
+/// ]);
+///
+/// // An unconstrained skeleton has none: its wavefront always collapses.
+/// assert!(skeleton(&square)?.residual().is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ResidualLoop {
+    /// The loop's corners, in wavefront order.
+    ///
+    /// These are ordinary skeleton nodes — the far ends of the arcs that stopped
+    /// here — so their [`Node::offset`] is where the wavefront got to.
+    pub nodes: Vec<NodeId>,
+    /// The input edge each segment came from: `edges[i]` owns the segment from
+    /// `nodes[i]` to `nodes[i + 1]`, wrapping at the end.
+    ///
+    /// Always the same length as [`ResidualLoop::nodes`]. Every point on that
+    /// segment is `min(offset, limit)` from `edges[i]`'s supporting line, and
+    /// parallel to it.
+    pub edges: Vec<EdgeId>,
+}
+
+impl ResidualLoop {
+    /// How many corners, and so also how many segments.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the loop is empty. It never is; this exists to satisfy the
+    /// convention that a type with `len` has `is_empty`.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The segments, as `(from, to, source edge)`, in wavefront order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use straight_skeleton::{skeleton_constrained, Point, Polygon};
+    ///
+    /// let square = Polygon::from_outer(&[
+    ///     Point::new(0, 0), Point::new(100, 0), Point::new(100, 100), Point::new(0, 100),
+    /// ])?;
+    /// let skel = skeleton_constrained(&square, &[20.0; 4])?;
+    ///
+    /// // Four sides, each parallel to the wall it came from.
+    /// let sides: Vec<_> = skel.residual()[0].segments().collect();
+    /// assert_eq!(sides.len(), 4);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn segments(&self) -> impl Iterator<Item = (NodeId, NodeId, EdgeId)> + '_ {
+        (0..self.nodes.len()).map(move |i| {
+            (
+                self.nodes[i],
+                self.nodes[(i + 1) % self.nodes.len()],
+                self.edges[i],
+            )
+        })
+    }
+}
+
 /// The straight skeleton of a [`Polygon`].
 ///
 /// A skeleton is a planar graph of [`Node`]s joined by [`Arc`]s. Build one with
@@ -227,6 +356,9 @@ pub struct Skeleton {
     /// `edge_nodes[i]` is the pair of boundary nodes at input edge `i`'s start
     /// and end vertices, which is where [`Skeleton::face`] begins its walk.
     pub(crate) edge_nodes: Vec<[NodeId; 2]>,
+    /// The wavefront loops that stopped instead of collapsing. Empty unless
+    /// per-edge limits bound.
+    pub(crate) residual: Vec<ResidualLoop>,
 }
 
 impl Skeleton {
@@ -240,6 +372,51 @@ impl Skeleton {
     #[inline]
     pub fn arcs(&self) -> &[Arc] {
         &self.arcs
+    }
+
+    /// The wavefront loops that stopped rather than collapsing — the offset
+    /// polygon a constrained skeleton leaves behind.
+    ///
+    /// **Empty for a plain [`skeleton`]**, whose wavefront always shrinks away
+    /// to nothing. Non-empty only where [`skeleton_constrained`]'s limits bound
+    /// hard enough to stop a whole loop, and then there is one entry per loop
+    /// still standing: the outer offset outline, plus one around each hole that
+    /// survived.
+    ///
+    /// This is the other half of a constrained result. The [`arcs`] are the
+    /// stubs reaching in from the boundary; this is the outline they stop on.
+    /// See [`ResidualLoop`] for why it is not made of arcs.
+    ///
+    /// [`skeleton`]: crate::skeleton
+    /// [`skeleton_constrained`]: crate::skeleton_constrained
+    /// [`arcs`]: Skeleton::arcs
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use straight_skeleton::{skeleton_constrained, Point, Polygon};
+    ///
+    /// // An L-shape, every wall stopped at 20.
+    /// let l = Polygon::from_outer(&[
+    ///     Point::new(0, 0), Point::new(200, 0), Point::new(200, 100),
+    ///     Point::new(100, 100), Point::new(100, 200), Point::new(0, 200),
+    /// ])?;
+    /// let skel = skeleton_constrained(&l, &[20.0; 6])?;
+    ///
+    /// // What is left is the same L, 20 in from every wall.
+    /// assert_eq!(skel.residual().len(), 1);
+    /// let mut corners: Vec<Point> =
+    ///     skel.residual()[0].nodes.iter().map(|&n| skel.node(n).position).collect();
+    /// corners.sort();
+    /// assert_eq!(corners, vec![
+    ///     Point::new(20, 20), Point::new(20, 180), Point::new(80, 80),
+    ///     Point::new(80, 180), Point::new(180, 20), Point::new(180, 80),
+    /// ]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[inline]
+    pub fn residual(&self) -> &[ResidualLoop] {
+        &self.residual
     }
 
     /// Number of nodes.
@@ -439,19 +616,47 @@ impl Skeleton {
                 .arcs_at(cur)
                 .iter()
                 .copied()
-                .find(|&a| Some(a) != came_from && self.arc(a).sources.contains(&e))?;
-            let other = self.arc(next_arc).other(cur)?;
+                .find(|&a| Some(a) != came_from && self.arc(a).sources.contains(&e));
+
+            let other = match next_arc {
+                Some(a) => {
+                    came_from = Some(a);
+                    self.arc(a).other(cur)?
+                }
+                // No arc leads on, which on a plain skeleton means the walk is
+                // lost. On a constrained one it usually means the opposite: the
+                // wavefront stopped here rather than collapsing, so what bounds
+                // the face is not an arc at all but the residual segment `e`
+                // stopped as. Cross it and carry on.
+                None => {
+                    came_from = None;
+                    self.residual_step(e, cur)?
+                }
+            };
+
             if other == start {
                 return Some(loop_);
             }
             loop_.push(other);
-            came_from = Some(next_arc);
             cur = other;
             // A face cannot have more corners than the skeleton has nodes.
             if loop_.len() > self.nodes.len() + 2 {
                 return None;
             }
         }
+    }
+
+    /// Crosses `e`'s residual segment, arriving at `cur`.
+    ///
+    /// Segments run in their edge's own direction, and [`Skeleton::face`] walks
+    /// a face the other way — from the edge's far end back to its near one — so
+    /// it always meets a segment at the `to` end and leaves by the `from` end.
+    fn residual_step(&self, e: EdgeId, cur: NodeId) -> Option<NodeId> {
+        self.residual
+            .iter()
+            .flat_map(|l| l.segments())
+            .find(|&(_, to, edge)| edge == e && to == cur)
+            .map(|(from, _, _)| from)
     }
 
     /// How many input edges the polygon had.
@@ -559,6 +764,7 @@ mod tests {
             ],
             node_arcs: Vec::new(),
             edge_nodes: Vec::new(),
+            residual: Vec::new(),
         };
         s.build_adjacency();
 
@@ -583,6 +789,7 @@ mod tests {
             arcs: vec![],
             node_arcs: Vec::new(),
             edge_nodes: Vec::new(),
+            residual: Vec::new(),
         };
         s.build_adjacency();
         assert_eq!(s.max_offset(), 5.0);

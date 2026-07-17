@@ -3,9 +3,35 @@
 Why the crate is shaped the way it is. [`ALGORITHM.md`](ALGORITHM.md) covers how
 the skeleton is actually computed; this covers the decisions around it.
 
-The stated priority order is **correct > understandable > fast**, and it is not
-decoration — it decided most of what follows, and it is the reason to reach for
-this crate or not.
+## The priority order
+
+**correct > fast > understandable.**
+
+It is not decoration — it decided most of what follows, and it is the reason to
+reach for this crate or not.
+
+Read the `>` as strict. Where speed and clarity conflict, speed wins and the
+clarity is bought back with a comment explaining what the code is doing and why
+the obvious version is not there: `scan_for_split` is two passes rather than one
+readable loop, the edges are stored transposed as well as as structs, and the
+wavefront carries an eight-slot cache that a naive implementation would not need.
+None of that is free to read, and all of it is measured.
+
+Where **correctness** and speed conflict, though, it is not a trade — correctness
+wins outright, and there is no amount of speed that buys it back:
+
+- `Polygon::check_simple` prunes, but only by tests that are exact (two segments
+  disjoint in x cannot cross). It stays `O(n^2)` in the worst case rather than
+  adopt a sweep-line algorithm whose degeneracy handling is a known source of
+  subtle wrongness. See [below](#validation-is-strict-and-up-front).
+- The predicates are exact `i32`, never `f32`, and the coordinate range is capped
+  a bit short to keep them so. See [below](#the-cap-and-the-single-expression-that-sets-it).
+- Every optimisation in the crate's history has been checked against the
+  behaviour it replaced, not just against the test suite. See
+  [Testing](#testing).
+
+The order is also why the numbers below are measured rather than derived. A
+priority you do not measure is a preference.
 
 ## Number types
 
@@ -62,11 +88,6 @@ mantissa bits; these products need up to 31. No range short of absurd fixes
 that, so the predicate is `i32` and the simulation is `f32`, and they are
 different tools for different jobs.
 
-(An earlier draft of this file asserted that `f32` rounds a full-scale
-determinant to zero. That turned out to be **false** when checked — it returns
-65536 against a true 65535: wrong, but not zero. The tests now encode what was
-actually verified. Search, don't assert.)
-
 ### The simulation is `f32` — and what that costs
 
 Skeleton nodes are irrational in general (rotate a 3-4-5 triangle and its
@@ -117,8 +138,8 @@ is `i32` and `f32` throughout.
 
 ### So is it GPU-ready?
 
-Honest answer: the *arithmetic* now is — `i32` and `f32` only. The *algorithm*
-is not, and no choice of number type would make it so. It is a sequential event
+Honest answer: the *arithmetic* is — `i32` and `f32` only. The *algorithm* is
+not, and no choice of number type would make it so. It is a sequential event
 simulation over a priority queue and a linked structure rewritten at every event.
 That is inherently serial. A parallel straight skeleton is a motorcycle-graph
 construction, not this.
@@ -142,16 +163,20 @@ to the same lattice point on a small enough polygon; when that matters, use
 ## No required dependencies
 
 The crate compiles with zero dependencies, `std` or `no_std`. That cost exactly
-one thing: `sqrt`, which is `std`-only and which `no_std` builds normally take
-from `libm`.
+two things, both small.
 
+`sqrt` is `std`-only, and `no_std` builds normally take it from `libm`.
 `math::sqrt_soft` is a Newton–Raphson refinement over the classic
 exponent-halving bit trick — about 20 lines. It is **always compiled**, even
 under `std`, specifically so it can be differentially tested against the hardware
 instruction. The tests sweep a wide range and assert agreement within 1 ULP, so
 turning `std` on or off cannot change which branch the algorithm takes.
 
-That is the only transcendental the algorithm needs; everything else is `+ - * /`.
+`f32::floor` is `std`-only too, and `math::floor_i32` covers the one place that
+needs it (the node grid's cell lookup). It is four lines and tested against
+`f32::floor` over a sweep.
+
+Everything else the algorithm needs is `+ - * /`.
 
 `alloc` is required. The event queue and wavefront arena grow with the input and
 there is no sensible fixed bound.
@@ -195,9 +220,25 @@ time `skeleton()` runs, zero-length edges and spikes cannot exist.
 The one repair performed is winding normalisation, because it is unambiguous and
 every caller wants it.
 
-The self-intersection check is naive all-pairs `O(n^2)`. It is comfortably
-cheaper than the skeleton itself, and keeping it obvious is worth more than the
-constant factor.
+**The self-intersection check is where the priority order earns its keep.** The
+obvious implementation is a naive all-pairs loop, and the obvious justification
+is that validation is far cheaper than the skeleton anyway. It is not: all-pairs
+costs 73ms against the skeleton's 13ms on a 3200-vertex comb — five times more
+than the thing it feeds, on the critical path of every caller.
+
+So it is a sweep along x, holding open only the edges whose x-range still
+overlaps the sweep line. Two segments with disjoint x-ranges cannot cross, so the
+skipped pairs are exactly the pairs that could not have failed; a y-overlap test
+then drops most of the rest before the exact predicates run. That takes the comb
+to 0.13ms.
+
+It is still `O(n^2)` in the worst case, and that is a deliberate stop. A polygon
+whose edges all span the full width genuinely has `n^2` pairs to test — a star of
+long spokes radiating from a centre only improves from 67ms to 17ms. Beating
+*that* needs a real sweep-line intersection algorithm, whose event ordering
+around vertical segments, shared endpoints and collinear overlaps is a well-known
+source of subtle wrongness. An exact prune that is sometimes no help beats an
+asymptotically better algorithm that is sometimes incorrect. `correct > fast`.
 
 ### `sources`, not `closest`
 
@@ -231,12 +272,103 @@ equality).
 
 Two consequences fall out of the semantics and are documented on the API:
 
-- A constrained skeleton is **disconnected** when limits bind. Once every edge
-  stops, what is left is disjoint stubs reaching in from the boundary. That is
-  the point of the transform, not a defect.
+- A constrained skeleton's **arcs** are disconnected when limits bind. Once every
+  edge stops, what the arcs are left as is disjoint stubs reaching in from the
+  boundary. That is the point of the transform, not a defect.
 - `offset` stops being a distance and becomes the wavefront's **time**. An edge
   that stopped at `limit` stays `limit` away however long the simulation runs, so
   the distance to a source edge `e` is `min(offset, limit_e)`.
+
+### The residual wavefront is half the answer
+
+Those stubs are not the whole result, and treating them as such is the mistake
+the API used to invite. A plain skeleton's wavefront shrinks away to nothing —
+that is what it means for it to be finished. A constrained one's need not: once
+every edge around a loop has stopped, the loop stops too, and stays there. What
+it stays as is the input offset inward by the limit, and `Skeleton::residual`
+returns it.
+
+That is most of the picture, not a footnote. An L-shape with every wall stopped
+at 20 has six stub arcs and a six-sided flat; the flat is the interesting part,
+and it looks like the input seen from the inside because that is what it is.
+
+It is **not** made of `Arc`s, and that is the one real design decision here. An
+arc bisects the supporting lines of exactly two input edges — that is what makes
+`Arc::sources` mean anything, and the whole provenance story rests on it. A
+residual segment is *parallel* to one input edge and belongs to it alone. Putting
+one in `arcs` would quietly break the invariant every consumer of `sources`
+relies on, to save a type. So it gets the type, with the shape it actually has:
+each segment names the one edge it came from.
+
+The loops inherit the input's winding, so the interior stays on the left of every
+segment — the outer loop counter-clockwise, a loop around a surviving hole
+clockwise. A hole's residual *grows*: its wavefront expands into the material, so
+an 80x50 hole limited at 10 comes back 100x70 while the outer boundary shrinks.
+
+`Skeleton::face` closes across it, so a constrained skeleton's faces are closed
+regions like any other's. Together with the residual they still tile the polygon
+exactly — the faces are what the wavefront swept, the residual is what it never
+reached — and the test that checks it has to sum the residual's areas *signed*,
+because a loop around a surviving hole is a hole in the unswept region rather
+than more of it.
+
+## Roof styles are a height function, not four algorithms
+
+`Roof` reads a skeleton off. What it does *not* get from the skeleton is height,
+because the skeleton has none: it is the roof's **plan**, saying where the hips,
+valleys and ridges run, and that is the same whatever the roof is shaped like.
+
+So the styles are one variable's worth of difference. Height is a function of
+`Node::offset` alone, and that function is the `Profile`:
+
+| style | profile | skeleton |
+|---|---|---|
+| hip | one pitch | plain |
+| mansard | two pitches with a break | plain |
+| truncated hip | one pitch | uniform limit |
+| truncated mansard | two pitches with a break | uniform limit |
+
+A **mansard**'s break sits at a constant offset, which is a constant height, so
+it comes out as a level kerb all the way round — which is what a real mansard
+has. Offset is affine in position across a face, so the break's level set is a
+straight line and cutting there leaves both halves flat. That cut is the only
+real work: a panel spanning the break would be *bent*, so each face is split in
+two and the corners the cut introduces are the roof's only vertices that stand
+over no skeleton node.
+
+Those corners are shared between the two panels either side of every arc, keyed
+by the unordered node pair. Minting one per panel would put two vertices at the
+same point and leave a crack down every hip.
+
+A **truncated** roof's flat is the residual raised to the limit's height. It
+needs no cutting whatever the profile, being level already.
+
+### Only uniform limits have a roof
+
+This is a real constraint rather than a missing feature, and it is worth being
+precise about. Height is a function of `offset`, and that only works while offset
+means *distance from the wall*. On a plain skeleton it always does. On a
+constrained one `offset` is the wavefront's **time**, which is the same thing
+only until something stops early — an edge that halted at 3 stays 3 from its face
+however long the clock runs on.
+
+With one uniform limit nothing stops early: every edge stops together, at the
+top, and the roof is a hip roof truncated to a flat. With uneven limits one
+wall's panel would want to end lower than its neighbour's and the surface between
+them would have to tear. There is no roof, so `RoofError::UnevenLimits` says so
+rather than returning a plausible-looking wrong one.
+
+`Roof` cannot measure distances — it never sees the polygon — so it tests the
+condition on the skeleton instead: every `LimitReached` node must sit at
+`max_offset`. Uniform limits satisfy that; any edge stopping early does not. It
+is conservative by construction, which is the right direction for it to fail in.
+
+Which edge you limit matters in a way that is easy to miss. On a 40x20 rectangle
+the ridge sits at offset 10 because the two *long* edges meet there, so limiting a
+long edge lowers the ridge — but limiting a *short* edge cannot lower it at all.
+What it does instead is **lengthen** it: the short wall's corners stop bisecting
+once it freezes and slide straight along it, meeting further out than they
+otherwise would.
 
 One configuration is refused: two **collinear neighbouring** edges given
 different limits. One line stops while the other, parallel to it, keeps going,
@@ -253,43 +385,66 @@ polygon and the skeleton and checking what must be true of any straight skeleton
 the *midpoint* (endpoints would pass trivially), boundary nodes have degree
 exactly 1, the graph is connected, offsets never exceed the boundary distance.
 
+**Faces are walked**, which is the check that pins the *combinatorics* rather
+than the geometry. A face only closes if the arcs naming its edge form exactly
+one loop, so a node placed on the wrong side of a degenerate tie fails it even
+though every individual node is still equidistant from the edges it names.
+
 **Expected geometry is derived by hand**, not read off the implementation: the
 9-12-15 triangle's incenter is at `(3,3)` because its inradius is
 `(9 + 12 - 15)/2 = 3`; a regular *n*-gon's peak offset is its apothem
-`r·cos(π/n)`; a 20x10 rectangle's ridge runs `(5,5)` to `(15,5)`.
+`r·cos(π/n)`; a 20x10 rectangle's ridge runs `(5,5)` to `(15,5)`; limiting a
+40x20 rectangle's short wall at 3 kinks its corners at `(37,3)` and `(37,17)`.
 
 **Symmetries are tested**, since they catch whole classes of ordering bug:
 translation invariance, invariance under which vertex is listed first, invariance
-under winding direction. The starting-vertex test is what caught a duplicate-node
-bug that every other test missed.
+under winding direction.
 
 **The degeneracies have their own tests**, because they are where the real bugs
-were: rectangle ridges, simultaneous four-corner collapse, collinear
+are: rectangle ridges, simultaneous four-corner collapse, collinear
 straight-through vertices, holes placed to pinch strips shut symmetrically,
 slivers, coordinates at the `i16` extremes.
+
+**The shapes the benchmark uses are tested too**, at full size. They have
+hundreds of reflex vertices, splits and needles, and are by far the most
+demanding input the crate sees. A skeleton that is fast and wrong still passes a
+benchmark.
+
+**Fast paths are checked against the slow ones they replaced.**
+`sweep_agrees_with_all_pairs_on_random_rings` runs `check_simple`'s sweep and the
+all-pairs loop it replaced over several thousand random rings on a deliberately
+tiny coordinate grid — small enough that crossings, collinear overlaps and shared
+endpoints are common rather than rare — and asserts the verdicts match. The
+claim being made is about every input, not about the shapes someone thought to
+write a test for. `edge_state_and_edge_lines_agree` does the same job for the two
+views of an edge's speed limit.
 
 **The examples are tests.** `roof` asserts every panel is genuinely planar, which
 holds only if the faces, node positions, and offsets are all correct *together* —
 a single misplaced node buckles its panel and trips it.
 
+**There is a harness for whole-skeleton diffs.** `examples/snapshot.rs` dumps
+every node and arc of a corpus of shapes with positions as raw bit patterns;
+`examples/compare.rs` diffs two such dumps *geometrically*, matching nodes by
+their sources and reporting the worst distance it had to bridge. A textual diff
+is useless here — the simulation is `f32`, so any change to the order arithmetic
+happens in moves results by an ULP — but "worst drift 8e-4 across every shape"
+is exactly the statement an optimisation needs to make.
+
 ## What is not here
 
-- **A sub-quadratic worst case.** Measured scaling is ~n^1.3 convex and ~n^1.9
-  to n^2.1 with reflex vertices; the quadratic term is `split_lower_bound`'s scan
-  over every edge. Beating it needs the **motorcycle graph**: reflex vertices
-  launch motorcycles along their bisectors, split events are exactly where they
-  crash, and motorcycle traces are *static rays* — so they can go in a spatial
-  index, which moving wavefront edges cannot. Given the graph, the skeleton
-  follows in `O(n log n)` (Cheng–Vigneron, Huber–Held). It is a different
-  algorithm and a much larger one; CGAL and Surfer2 also ship `O(n^2)` worst
-  cases. See ALGORITHM.md.
+- **A sub-quadratic worst case.** Measured scaling is ~n^1.2 convex, and ~n^1.3
+  rising to ~n^1.7 with reflex vertices as `n` grows; the quadratic term is
+  `scan_for_split`'s pass over every edge. Beating it needs the **motorcycle
+  graph**, which is a different algorithm, would not obviously serve
+  `skeleton_constrained`, and cannot be bolted on as a pruner. ALGORITHM.md
+  works through why. CGAL and Surfer2 also ship `O(n^2)` worst cases.
+- **A defined resolution of simultaneous events.** Where events genuinely
+  coincide, different orderings give different but equally valid skeletons, and
+  the crate does not promise which. See ALGORITHM.md.
 - **Weights other than 0 and 1.** The machinery is general — `velocity_of` solves
   for arbitrary speeds — but arbitrary weights raise degeneracies that are not
   tested, so the API does not expose them.
-- **The residual wavefront.** A constrained skeleton leaves an offset polygon
-  behind; it is not returned, since a wavefront edge is *parallel* to an input
-  edge rather than bisecting two, and putting it in `arcs` would break what an
-  `Arc` means. Worth adding as its own type.
 - **Medial axis.** Different structure, curved arcs. See above.
 - **Polygons over 65534 vertices.** `VertexId` is a `u16`, which keeps `Arc` at
   16 bytes. `TooManyVertices` says so.

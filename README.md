@@ -87,6 +87,32 @@ let skel = skeleton_constrained(&square, &[3.0, f32::INFINITY, f32::INFINITY, f3
 This is not a bolted-on mode: both entry points run the same *weighted*
 wavefront, and all-`INFINITY` limits reproduce `skeleton()` exactly.
 
+When limits bind hard enough, the wavefront **stops** instead of collapsing —
+and what it stops as is the other half of the answer. The arcs are stubs
+reaching in from the boundary; `residual()` is the outline they stop on, which
+is the input offset inward by the limit. It looks like the outside seen from the
+inside, because that is exactly what it is.
+
+```rust
+// The 10x10 square, every edge stopped at 3: a 4x4 square is left standing.
+let skel = skeleton_constrained(&square, &[3.0; 4])?;
+let flat = &skel.residual()[0];
+
+let mut corners: Vec<Point> = flat.nodes.iter().map(|&n| skel.node(n).position).collect();
+corners.sort();
+assert_eq!(corners, vec![
+    Point::new(3, 3), Point::new(3, 7), Point::new(7, 3), Point::new(7, 7),
+]);
+
+// A plain skeleton has none: its wavefront always shrinks away to nothing.
+assert!(skeleton(&square)?.residual().is_empty());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Each segment names the one wall it came from and runs parallel to it — which is
+why it is not an `Arc`: an arc bisects *two* edges, and putting these in `arcs`
+would break what `sources` means.
+
 **Roofs, in `i16`, built in.** Each input edge owns one skeleton face; lift its
 nodes to `z = offset * pitch` and the face is a flat roof panel. `Roof` does
 that for you, and every panel carries the wall it rises from:
@@ -99,13 +125,57 @@ assert_eq!(roof.panels().len(), 4);          // one panel per wall
 let apex: i16 = roof.ridge_height();         // i16, like everything else
 
 for panel in roof.panels() {
-    let wall = panel.wall;                   // which wall this panel rises from
+    let wall = panel.wall();                 // which wall this panel rises from
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Panels are planar by construction, not by fitting: every point on one is
 `offset` from the same wall's line, and height is linear in that distance.
+
+**Mansard and truncated roofs, off the same skeleton.** A skeleton is a roof's
+*plan* — where the hips, valleys and ridges run — and that does not depend on how
+high anything is. So the style is one variable: the `Profile`, which says how
+height grows with distance from the eaves.
+
+```rust
+use straight_skeleton::{skeleton_constrained, Roof};
+
+// Steep to a kerb at 10, then shallow. Two panels per wall, split along a
+// level break line; the corners that split introduces are shared between
+// neighbours, so the mesh stays watertight.
+let mansard = Roof::mansard(&skel, 2.0, 10.0, 0.25)?;
+
+// Stop every wall at 15 and the apex is cut off, leaving a flat on top —
+// which is the constrained skeleton's residual, raised.
+let truncated = Roof::new(&skeleton_constrained(&square, &[15.0; 4])?, 0.5)?;
+assert_eq!(truncated.flat().count(), 1);
+
+// The two compose: steep, then shallow, then flat.
+let both = Roof::mansard(&skeleton_constrained(&square, &[15.0; 4])?, 2.0, 10.0, 0.25)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A limit of **zero** does the opposite job, and gives you gables. The wall never
+moves, so it sweeps nothing: its panel is the degenerate face stood on end — a
+vertical gable — and the ridge runs out to it rather than hipping away. A mansard
+with gable ends is a *gambrel*, the barn roof:
+
+```rust
+// A 240x90 hall with both short ends frozen. The ridge now runs the whole 240.
+let gabled = skeleton_constrained(&hall, &[f32::INFINITY, 0.0, f32::INFINITY, 0.0])?;
+let gambrel = Roof::mansard(&gabled, 2.0, 10.0, 0.25)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`cargo run --example roof` writes every style of every plan as OBJ.
+
+Limits must be uniform **or zero** for a roof, and that is geometry rather than a
+gap. An edge stopping partway still has a sloping panel, which would end lower
+than its neighbour's and tear the surface between them — so
+`RoofError::UnevenLimits` says so rather than returning a plausible wrong answer.
+A zero-limit wall has no sloping panel to be inconsistent about, which is exactly
+why gables are allowed where half-measures are not.
 
 **Holes, with no special case.** A hole is a wavefront loop that expands instead
 of shrinking. Its corners come out reflex, and reflex corners already split the
@@ -115,13 +185,16 @@ wavefront, so holes work by the mechanism that was already there.
 
 ```sh
 cargo run --example svg     # draws a gallery to target/svg/index.html
-cargo run --example roof    # writes hip roofs as .obj to target/roofs/
+cargo run --example roof    # writes roofs as .obj to target/roofs/
 ```
 
 `svg` renders each shape with its skeleton, colouring arcs by their source edge
-so the provenance is visible. `roof` uses the library's `Roof` type and only
-adds the OBJ serialisation, since choosing a file format is the caller's
-business rather than the crate's.
+so the provenance is visible, and shading the residual where a constrained shape
+has one. `roof` writes every plan four ways — hip, mansard, truncated, truncated
+mansard — off one skeleton each; it uses the library's `Roof` type and adds only
+the OBJ serialisation and the triangulation that goes with it, since choosing a
+file format and a mesh representation are the caller's business rather than the
+crate's.
 
 ## Coordinates: `i32` and `f32`, no `f64`
 
@@ -191,22 +264,27 @@ hardware instruction to within 1 ULP, so the feature flag cannot change results.
 ## Performance
 
 Measured with `cargo run --release --example bench`, which reports the empirical
-growth exponent rather than a claim:
+growth exponent rather than a claim, and times `Polygon::new` alongside the
+skeleton — validation has its own complexity, and leaving it off the clock would
+report the crate as faster than any caller can actually get a skeleton.
 
-| input | 1024 vertices | scaling |
-|---|---|---|
-| convex | 1.1 ms | ~n^1.3 |
-| comb (512 reflex) | 8.9 ms | ~n^1.9 |
-| random star (512 reflex) | 13 ms | ~n^2.1 |
+| input | 1024 vertices | 3200 vertices | scaling |
+|---|---|---|---|
+| convex | 1.2 ms (at 828) | — (hits the coordinate cap) | ~n^1.2 |
+| comb (half reflex) | 2.0 ms | 12 ms | ~n^1.3, rising to ~n^1.7 |
+| random star (half reflex) | 2.9 ms | 16 ms | ~n^1.4, rising to ~n^1.6 |
 
-**Convex input is sub-quadratic** — it has no reflex vertices, so it never
-searches for split events at all. With reflex vertices the search is `O(n)` per
-reflex vertex, giving `O(n^2)` overall, and the measurements agree.
+The event count is linear and each event reschedules `O(1)` vertices. The one
+non-constant step is the split search, which scans every edge for each reflex
+vertex — so the worst case is `O(n^2)`, and the rising exponent is that term
+gradually taking over as `n` grows. **Convex input never runs it at all**, having
+no reflex vertices to search from.
 
-Beating `O(n^2)` in the worst case needs the motorcycle-graph machinery of
-Eppstein–Erickson or Cheng–Vigneron. That is a different algorithm and a much
-larger one; practical implementations (CGAL, Surfer2) also ship an `O(n^2)`
-worst case. `docs/DESIGN.md` explains what it would take and why it is not here.
+Beating `O(n^2)` needs the motorcycle graph. It is a genuinely different
+algorithm rather than an optimisation, it would not obviously serve
+`skeleton_constrained`, and — for the reason `docs/ALGORITHM.md` works through —
+it cannot be bolted on as a mere pruner. CGAL and Surfer2 ship an `O(n^2)` worst
+case too.
 
 Space is `O(n)`.
 

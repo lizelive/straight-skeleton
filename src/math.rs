@@ -79,6 +79,24 @@ pub(crate) fn sqrt_soft(x: f32) -> f32 {
     y
 }
 
+/// `x.floor() as i32`, without `std`.
+///
+/// `f32::floor` lives in `std`, and the crate takes no dependency on `libm`, so
+/// the one place that needs a floor carries it here. `as i32` truncates toward
+/// zero, which is the floor only for non-negative input; the correction is one
+/// step down for negatives that were not already integral.
+///
+/// Saturates for input outside `i32`, which is what `as i32` already does.
+#[inline]
+pub fn floor_i32(x: f32) -> i32 {
+    let t = x as i32;
+    if x < t as f32 {
+        t - 1
+    } else {
+        t
+    }
+}
+
 /// A 2D vector in the algorithm's internal `f32` working space.
 ///
 /// Public input and output coordinates are `i16` (see [`crate::Point`]); this
@@ -254,6 +272,37 @@ mod tests {
         assert!(sqrt_soft(-1.0).is_nan());
         assert!(sqrt_soft(f32::NAN).is_nan());
         assert_eq!(sqrt_soft(f32::INFINITY), f32::INFINITY);
+    }
+
+    #[test]
+    fn floor_i32_matches_std_floor() {
+        for x in [
+            0.0f32,
+            1.0,
+            1.5,
+            -1.0,
+            -1.5,
+            -0.5,
+            0.5,
+            1e6,
+            -1e6,
+            16384.0,
+            -16384.0,
+            1_638_400.0,
+            -1_638_400.0,
+            -0.0,
+        ] {
+            assert_eq!(floor_i32(x), x.floor() as i32, "floor_i32({x})");
+        }
+    }
+
+    #[test]
+    fn floor_i32_over_a_sweep() {
+        let mut x = -3000.0f32;
+        while x < 3000.0 {
+            assert_eq!(floor_i32(x), x.floor() as i32, "floor_i32({x})");
+            x += 0.37;
+        }
     }
 
     #[test]

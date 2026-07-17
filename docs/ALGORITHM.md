@@ -138,6 +138,28 @@ run the same simulation; the former simply never schedules a speed change.
 
 This is the *weighted* straight skeleton, restricted to weights in `{0, 1}`.
 
+### What stops when everything stops
+
+The table's last row has a consequence worth following. A plain skeleton always
+finishes by its wavefront shrinking away to nothing — every edge is closing on
+another, so something always collapses eventually. Freeze every edge around a
+loop, though, and nothing is closing on anything: the loop stops, and stays
+exactly where it is, forever.
+
+So the simulation runs out of events with the loop still standing. That is not a
+stall to be fixed — it is the answer. What is standing is the input polygon
+offset inward by the limit, and `Sim::collect_residual` reads it straight off the
+`prev`/`next` links once the queue is empty. Each surviving vertex's `node` is
+already the node its arc stopped at, so there is nothing to compute.
+
+It is the only way a vertex can outlive the queue, which is what makes the
+reading unambiguous: `velocity_of` returns zero only when *both* of a vertex's
+edges have stopped. (A needle's antiparallel pair also sits still, but
+`resolve_needle` retires those on the spot rather than leaving them behind.)
+
+See [`DESIGN.md`](DESIGN.md#the-residual-wavefront-is-half-the-answer) for why
+this comes back as its own type rather than as more arcs.
+
 ## Finding the events
 
 **Edge collapse** is one-dimensional, which is the trick worth knowing. Both
@@ -147,14 +169,14 @@ the edge's own direction and ask when it reaches zero. That is linear in `t`, so
 it is one divide, with no special cases (`Sim::edge_event`).
 
 **Split** is the expensive one, and how you ask the question decides whether the
-whole algorithm works or melts down.
+whole algorithm works.
 
-The naive version asks the whole question at once: *when does this reflex vertex
-land on a live stretch of some other edge?* That needs the current endpoints of
-every candidate edge — and those endpoints belong to a part of the wavefront
-arbitrarily far away. It couples everything to everything. See below.
+The obvious version asks the whole question at once: *when does this reflex
+vertex land on a live stretch of some other edge?* That needs the current
+endpoints of every candidate edge — and those endpoints belong to a part of the
+wavefront arbitrarily far away, which couples everything to everything.
 
-The version here asks a deliberately weaker question (`split_lower_bound`):
+The version here asks a deliberately weaker question (`Sim::scan_for_split`):
 
 > when does this vertex reach some edge's **moving line** — never mind whether it
 > lands on a live stretch of it?
@@ -164,19 +186,53 @@ which is the only property needed for popping events in time order to stay
 correct. And it is cheap to keep true: an edge's wavefront slides along its own
 offset track and never leaves it, so the answer depends only on the vertex's
 trajectory and the edge's original line. **Nothing happening elsewhere can
-change it.**
+change it.** That is what keeps an event's dependencies `O(1)` — see
+"Staleness" below.
 
-The real question is settled later, in `handle_split_event`, when the event is
-popped. By then `now == t`, every earlier event has been processed, and the
+The real question is settled later, in `Sim::handle_split_event`, when the event
+is popped. By then `now == t`, every earlier event has been processed, and the
 wavefront's shape at `t` is not a forecast but settled fact — so
 `live_stretch_at` simply *looks*. If the vertex came down off the end of every
 live stretch, no split happens: the edge is struck off (a vertex travels in a
 straight line, so it meets that line once and the question is closed for good)
-and the next candidate is queued.
+and the next candidate is taken.
 
-The scan is `O(n)` per reflex vertex, and it is the only non-constant step left.
+### The bound is time-invariant, and the scan exploits it
 
-## Staleness, and the meltdown it hid
+Write the distance from the vertex to edge `e`'s moving line at time `u` as
+`d(u) = d(t0) + closing * (u - t0)`, with `closing` constant along a fixed
+trajectory. The crossing time is then
+
+```
+    t = u + d(u) / -closing = t0 - d(t0) / closing
+```
+
+and the `u` cancels. **The answer does not depend on when it was asked.** So the
+scan is done once per trajectory and its result kept in a `SplitCache`, rather
+than recomputed each time a neighbour moves and forces a reschedule. Only
+`handle_speed_change` can falsify it, by changing an edge's `closing` — and it
+invalidates every vertex, not just the ones it moves, because a bound is a race
+between a vertex and a *target* edge.
+
+The cache keeps the earliest `SPLIT_FANOUT` (8) candidates, not just one.
+Rejections are not the rare case — on star-like input about three quarters of all
+split events are rejections, averaging ~3 per reflex vertex — and each one would
+otherwise cost a fresh scan to replace the candidate it struck off. Since the
+candidates are consumed in increasing time order, the next one is simply the next
+in the list.
+
+The scan itself is two passes, because they want opposite things. Computing a
+crossing time is the same handful of arithmetic for every edge with no reason to
+branch, so the first pass does exactly that over `EdgeLines` — the edges'
+normals, offsets and limits transposed into one flat array each — and writes
+`INFINITY` where there is no crossing. No `continue`, nothing to trip the
+vectoriser. Picking the earliest few is all branching and no arithmetic, so it
+gets its own pass over the resulting contiguous `f32`s.
+
+It is still `O(n)` per scan, and it is the only non-constant step left in the
+simulation.
+
+## Staleness
 
 Events are queued, never removed; obsolete ones are recognised when popped. Two
 independent stamps do it, and conflating them loses events:
@@ -192,28 +248,20 @@ marks a vertex and its `prev`, and that is provably complete, because exactly
 two events are computed from any vertex's geometry: its own, and its
 predecessor's edge event watching the two of them converge.
 
-It is worth seeing what happens when that is not true, because this crate did it
-the other way first and the result was spectacular. Stamping a split event with
-the two endpoints of the edge it was aimed at made a vertex's event depend on a
-part of the wavefront arbitrarily far away. Then:
+Split events are not in that set at all, which is the point of asking the weaker
+question above: a split's timing is computed from the target edge's supporting
+line, and no vertex over there can invalidate it.
 
-1. any event invalidated events all over the polygon;
-2. every reschedule re-registered more dependencies;
-3. which made the next event invalidate even more.
+### Rescheduling is deduplicated
 
-It fed back on itself. A 132-vertex comb took 124ms; a 260-vertex one asked for
-**27GB** and died. Measured growth: **n^5.5**. The file you are reading claimed
-`O(n^2 log n)` at the time — the claim was theory, and nobody had run it.
+A single event reaches the same vertex by several routes — as the merged vertex,
+as a neighbour's `prev`, and as an explicit mark. Rescheduling it once per route
+queues an event per route and immediately strands all but the last. So marks go
+through `Sim::mark`, which is idempotent within an event, and every handler
+defers scheduling to the drain rather than scheduling inline.
 
-The fix was not better bookkeeping. It was noticing that a split's *timing never
-depended on those endpoints in the first place*, which is what `split_lower_bound`
-is. The same comb now runs 1028 vertices in 8.9ms.
-
-A second, smaller one hid behind it: the struck-off list was scanned linearly
-*inside* the per-edge loop, so one scan cost `O(n * rejections)`. Sorting it and
-binary-searching took a random star from `n^3.0` to `n^2.2`.
-
-Both were bookkeeping, not geometry. That is the argument for measuring.
+Left undeduplicated this is not a rounding error: it was **77–89% of all popped
+events**, including on convex input, which has no split events to blame.
 
 ## The degeneracies that actually bite
 
@@ -261,42 +309,78 @@ exposes the next.
 
 A two-vertex loop stalls for the same reason and is resolved the same way.
 
-## Complexity, and the meltdown that hid in it
+### Simultaneous events have no defined resolution
 
-Measured, with `cargo run --release --example bench`:
+Where several events genuinely coincide — the interior of a comb, whose
+identical evenly-spaced teeth make exact ties the norm — which one is processed
+first is not defined, and different orderings produce **different but equally
+valid** skeletons. The arcs are the same length and meet the same edges; which
+node ends up carrying which sources can differ.
 
-| input | scaling | why |
-|---|---|---|
-| convex | ~n^1.3 | no reflex vertices, so `split_lower_bound` is never called |
-| reflex-heavy | ~n^1.9 to n^2.1 | `O(1)` events, each `O(n)` to schedule |
+So do not diff two skeletons node by node and expect a match. What is guaranteed
+is what `tests/common/check_invariants` checks: every node is `offset` from every
+edge it names, every arc bisects its pair along its whole length, boundary nodes
+have degree 1, and every face closes.
+
+## What it costs
+
+Measured, with `cargo run --release --example bench`, which also times
+`Polygon::new` — validation has its own complexity, and leaving it off the clock
+would report the crate as faster than any caller can actually get a skeleton.
+
+| input | 1024 vertices | 3200 vertices | scaling |
+|---|---|---|---|
+| convex | 1.2 ms (at 828) | — (coordinate cap) | ~n^1.2 |
+| comb, half reflex | 2.0 ms | 12 ms | ~n^1.3 rising to ~n^1.7 |
+| random star, half reflex | 2.9 ms | 16 ms | ~n^1.4 rising to ~n^1.6 |
 
 Space is `O(n)`.
 
-The event count is **linear** — about 5n pops for a comb, 10n for a star — and
+The event count is **linear** — about 3n pops for a comb, 6n for a star — and
 each event reschedules `O(1)` vertices. The quadratic term is entirely
-`split_lower_bound`'s scan over every edge.
+`scan_for_split`'s pass over every edge, which is why the exponent climbs with
+`n`: the constant is now small enough that the linear work dominates at these
+sizes, and the quadratic term only takes over later. It does still take over.
 
-That is worth stating carefully, because an earlier version of this file claimed
-`O(n^2 log n)` and the real figure was `n^5.5`, on its way to asking for 27GB at
-260 vertices. The claim was theory; nobody had measured. Two things were wrong,
-and both were in the *bookkeeping*, not the geometry:
+`Polygon::new` is separately `O(n^2)` in the worst case; see
+[`DESIGN.md`](DESIGN.md#validation-is-strict-and-up-front).
 
-- Split events depended on the endpoints of the edge they were aimed at, so any
-  event invalidated events all over the polygon, each reschedule registered more
-  dependencies, and it fed back on itself. Fixed by
-  [`split_lower_bound`](#finding-the-events): the timing never depended on those
-  endpoints in the first place.
-- The reject list was scanned linearly *inside* the per-edge loop, making one
-  scan `O(n * rejections)`. Sorting it and binary-searching took a star from
-  `n^3.0` to `n^2.2`.
+## Beating the quadratic: the motorcycle graph
 
-Beating `O(n^2)` in the worst case needs the motorcycle graph. Reflex vertices
-launch "motorcycles" along their bisectors; split events are exactly where
-motorcycles crash, and — crucially — motorcycle traces are **static rays**, so
-they can go in a spatial index, which moving wavefront edges cannot. Given the
-motorcycle graph, the skeleton follows in `O(n log n)` (Cheng–Vigneron,
-Huber–Held). It is a different algorithm, and a much larger one; CGAL and
-Surfer2 ship an `O(n^2)` worst case too.
+The `O(n)` split scan is the only thing standing between this and a
+sub-quadratic algorithm, and the known way past it is the **motorcycle graph**.
+
+Every reflex vertex launches a "motorcycle" from its position along its bisector,
+at its wavefront speed. Motorcycles leave a trace and crash when they hit a wall
+or an earlier trace. The resulting arrangement is the motorcycle graph, and the
+theorem that makes it interesting (Eppstein–Erickson; Cheng–Vigneron) is that
+**every arc a reflex wavefront vertex traces is part of it**. So the graph
+contains the hard part of the skeleton, and given it the rest follows in
+`O(n log n)`.
+
+Why it can go faster is worth being precise about, because it is the same reason
+this crate cannot. Motorcycle traces are **static rays**. Static things can go in
+a spatial index. The moving lines `scan_for_split` searches cannot — a line is
+infinite, so no bounding volume excludes it, and the "line" it is racing is at a
+different offset every instant. That is the whole trade, and it is why the scan
+looks at all `n` edges rather than a local few.
+
+It is not a drop-in, and three things make it a different project rather than an
+optimisation:
+
+- **The graph is its own kinetic simulation**, with its own degeneracies —
+  simultaneous crashes, and the chicken-and-egg where a motorcycle crashes into
+  the trace of one that itself crashes earlier and so never laid that trace.
+- **It would not serve `skeleton_constrained`.** The theory is developed for the
+  unweighted skeleton; this crate's edges have speeds in `{0, 1}`, and the
+  reflex-trace-containment theorem is not something to assume carries over.
+- **It does not help the measured bottleneck cheaply.** The tempting shortcut —
+  compute the graph, use each motorcycle's crash time to bound its vertex's
+  search — does not work. Rejected candidates have crossing times *before* the
+  true split, so a bound at the crash excludes none of them. The graph pays off
+  only if you adopt the whole construction and stop searching for splits at all.
+
+CGAL and Surfer2 both ship an `O(n^2)` worst case too.
 
 ## Where it is not the medial axis
 
@@ -351,5 +435,9 @@ is planar as it goes.
 - Felkel, Obdržálek, *Straight Skeleton Implementation* (1998) — the SLAV
   formulation this crate's structure resembles. Note that its split-event
   handling is known to be incomplete on some inputs.
+- Eppstein, Erickson, *Raising Roofs, Crashing Cycles, and Playing Pool* (1999) —
+  the motorcycle graph.
+- Cheng, Vigneron, *Motorcycle Graphs and Straight Skeletons* (2002) — the
+  sub-quadratic construction.
 - Huber, Held, *Theoretical and Practical Results on Straight Skeletons of
   Planar Straight-Line Graphs* (2011) — on the degeneracies that actually matter.

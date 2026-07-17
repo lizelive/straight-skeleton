@@ -14,7 +14,15 @@
 //! - the **skeleton arcs**, coloured by which input edge they belong to, so you
 //!   can see the provenance from [`Arc::sources`] directly,
 //! - the **skeleton faces** as translucent fills — one face per input edge,
+//! - the **residual wavefront** in green, where there is one: the offset polygon
+//!   a constrained skeleton stops as. It looks like the input seen from the
+//!   inside, because that is exactly what it is,
 //! - **nodes**, sized by kind, labelled with their offset.
+//!
+//! The constrained shapes are the ones worth looking at twice. A plain skeleton
+//! fills its polygon with faces and has no residual; a constrained one is the
+//! other way round wherever its limits bind, since the wavefront stopped before
+//! any face could close.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -44,8 +52,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = format!("{name}.svg");
         fs::write(out.join(&file), &svg)?;
 
+        // Report the residual, since on a constrained shape it is most of what
+        // there is to see and its absence would otherwise look like a bug.
+        let flat = match skel.residual() {
+            [] => String::new(),
+            loops => format!(
+                ", flat: {}",
+                loops
+                    .iter()
+                    .map(|l| format!("{}-gon", l.len()))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            ),
+        };
         let note = format!(
-            "{} vertices, {} nodes, {} arcs, ridge {:.2}{}",
+            "{} vertices, {} nodes, {} arcs, ridge {:.2}{}{flat}",
             poly.vertex_count(),
             skel.node_count(),
             skel.arc_count(),
@@ -189,13 +210,32 @@ fn gallery() -> Vec<(String, Polygon, Option<Vec<f32>>)> {
     let n = p.edge_count();
     g.push(("square-limit-15".into(), p, Some(vec![15.0; n])));
 
-    // Constrained, non-uniformly: the bottom edge is held back at 10 while the
-    // rest run free.
+    // Constrained, non-uniformly: the bottom edge — one of the 200-long pair —
+    // is held back at 10 while the rest run free. The limit binds before the
+    // ridge forms, so the bottom face is a strip and the ridge sits off-centre.
     let p = Polygon::from_outer(&rect).unwrap();
     let mut limits = vec![f32::INFINITY; p.edge_count()];
     limits[0] = 10.0;
-    g.push(("rectangle-limit-one-edge".into(), p, Some(limits)));
+    g.push(("rectangle-limit-long-edge".into(), p, Some(limits)));
 
+    // The same limit on a *short* edge instead, which is a different situation
+    // rather than the same picture rotated. The rectangle is 200x100, so the
+    // unconstrained skeleton's ridge runs along the long axis and is fed by the
+    // two long edges meeting at offset 50; the short edges only ever reach
+    // offset 50 at the very ends. Stopping a short edge at 10 therefore binds
+    // early on a face that was small to begin with, and the two edges adjacent
+    // to it — the long ones — slide along the stopped edge rather than over it.
+    let p = Polygon::from_outer(&rect).unwrap();
+    let mut limits = vec![f32::INFINITY; p.edge_count()];
+    limits[1] = 10.0;
+    g.push(("rectangle-limit-short-edge".into(), p, Some(limits)));
+
+    // Every wall stopped at 20, so nothing collapses: the whole wavefront is
+    // still standing when the simulation runs out of events. The arcs are six
+    // short stubs and the rest of the picture is the residual — the same L, 20
+    // in from every wall. Note the reflex corner at (100, 100): it comes out at
+    // (80, 80), *further* from the boundary, because a reflex corner runs
+    // backwards along its bisector into the material.
     let p = Polygon::from_outer(&[
         Point::new(0, 0),
         Point::new(200, 0),
@@ -207,6 +247,26 @@ fn gallery() -> Vec<(String, Polygon, Option<Vec<f32>>)> {
     .unwrap();
     let n = p.edge_count();
     g.push(("l-shape-limit-20".into(), p, Some(vec![20.0; n])));
+
+    // A hole that survives leaves a residual loop of its own, wound the other
+    // way: the outer outline shrinks inward while the hole's grows outward.
+    let p = Polygon::new(
+        &[
+            Point::new(0, 0),
+            Point::new(200, 0),
+            Point::new(200, 150),
+            Point::new(0, 150),
+        ],
+        &[vec![
+            Point::new(60, 50),
+            Point::new(140, 50),
+            Point::new(140, 100),
+            Point::new(60, 100),
+        ]],
+    )
+    .unwrap();
+    let n = p.edge_count();
+    g.push(("rect-with-hole-limit-10".into(), p, Some(vec![10.0; n])));
 
     g
 }
@@ -255,6 +315,30 @@ fn render(poly: &Polygon, skel: &Skeleton) -> String {
                 edge_colour(EdgeId(i as u16), ne),
             );
         }
+    }
+
+    // The residual wavefront: where a constrained skeleton's arcs stop, and the
+    // flat they stop on. Drawn as a filled region rather than an outline because
+    // that is what it is — the offset polygon still standing, the flat top of a
+    // truncated roof. Empty for a plain skeleton, so this draws nothing there.
+    //
+    // One path with a subpath per loop, so `evenodd` punches a hole where a
+    // residual loop sits inside another.
+    if !skel.residual().is_empty() {
+        let mut d = String::new();
+        for l in skel.residual() {
+            for (k, &n) in l.nodes.iter().enumerate() {
+                let p = skel.node(n).exact;
+                let cmd = if k == 0 { 'M' } else { 'L' };
+                let _ = write!(d, "{cmd}{:.2},{:.2} ", p[0], p[1]);
+            }
+            d.push('Z');
+        }
+        // Same green as the LimitReached nodes that are its corners.
+        let _ = writeln!(
+            s,
+            r##"<path d="{d}" fill="#0f9d58" fill-opacity="0.22" fill-rule="evenodd" stroke="#0f9d58" stroke-width="1.5" stroke-linejoin="round"/>"##,
+        );
     }
 
     // Skeleton arcs, coloured by their first source edge.

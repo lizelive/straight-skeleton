@@ -18,9 +18,10 @@
 //! ```
 //!
 //! Straight skeletons are how you find a polygon's medial ridge, generate
-//! mitred offset curves, or raise a hip roof over a floor plan (each skeleton
-//! node's distance from the boundary *is* the roof height there — see the
-//! `roof` example).
+//! mitred offset curves, or raise a roof over a floor plan — hip, mansard, or
+//! truncated, all off the same skeleton, since each node's distance from the
+//! boundary *is* the run the roof has had to rise over. See [`Roof`] and the
+//! `roof` example.
 //!
 //! # Quick start
 //!
@@ -74,8 +75,8 @@
 //!
 //! Each input edge also owns one skeleton **[face]**, the region its wavefront
 //! swept. The faces tile the polygon, and every face is planar once lifted to
-//! `z = offset` — which is why [`Roof`] can raise a hip roof over a floor plan
-//! by reading the skeleton off rather than computing anything:
+//! `z = offset` — which is why [`Roof`] can raise a roof over a floor plan by
+//! reading the skeleton off rather than computing anything:
 //!
 //! ```
 //! use straight_skeleton::{skeleton, Point, Polygon, Roof};
@@ -83,10 +84,16 @@
 //! let plan = Polygon::from_outer(&[
 //!     Point::new(0, 0), Point::new(120, 0), Point::new(120, 80), Point::new(0, 80),
 //! ])?;
+//! let skel = skeleton(&plan)?;
 //!
-//! let roof = Roof::new(&skeleton(&plan)?, 0.5)?;
+//! let roof = Roof::new(&skel, 0.5)?;
 //! assert_eq!(roof.panels().len(), 4);   // one flat panel per wall
 //! assert_eq!(roof.ridge_height(), 20);  // i16, like every other coordinate
+//!
+//! // The skeleton is the roof's *plan*, not its height, so a mansard reads off
+//! // the very same one — only its [`Profile`] differs.
+//! let mansard = Roof::mansard(&skel, 2.0, 10.0, 0.25)?;
+//! assert_eq!(mansard.panels().len(), 8);  // the break cuts each wall's in two
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -120,6 +127,28 @@
 //!
 //! // Nothing gets further from the boundary than the limit allows.
 //! assert!(skel.max_offset() <= 3.0 + 1e-4);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! What the wavefront stops *as* is the other half of the answer, and
+//! [`Skeleton::residual`] returns it: the input polygon offset inward by the
+//! limit — the flat left in the middle of a truncated roof. The arcs are the
+//! stubs reaching in from the boundary; the residual is the outline they stop
+//! on.
+//!
+//! ```
+//! use straight_skeleton::{skeleton, skeleton_constrained, Point, Polygon};
+//!
+//! let square = Polygon::from_outer(&[
+//!     Point::new(0, 0), Point::new(100, 0), Point::new(100, 100), Point::new(0, 100),
+//! ])?;
+//!
+//! // Stop every edge at 20 and a 60x60 square is left standing in the middle.
+//! let skel = skeleton_constrained(&square, &[20.0; 4])?;
+//! assert_eq!(skel.residual()[0].len(), 4);
+//!
+//! // A plain skeleton has none: its wavefront always shrinks away to nothing.
+//! assert!(skeleton(&square)?.residual().is_empty());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -208,8 +237,8 @@ mod interop;
 
 pub use point::Point;
 pub use polygon::{EdgeId, Polygon, PolygonError, RingId, VertexId};
-pub use roof::{Panel, Point3, Roof, RoofError, RoofVertex};
-pub use skeleton::{Arc, ArcId, Node, NodeId, NodeKind, Skeleton};
+pub use roof::{Panel, PanelKind, Point3, Profile, Roof, RoofError, RoofVertex, RoofVertexId};
+pub use skeleton::{Arc, ArcId, Node, NodeId, NodeKind, ResidualLoop, Skeleton};
 pub use wavefront::SkeletonError;
 
 /// Computes the straight skeleton of a polygon.
@@ -228,20 +257,26 @@ pub use wavefront::SkeletonError;
 /// `O(n)` space. For time, measured growth (`cargo run --release --example
 /// bench`) rather than a claim:
 ///
-/// | input | 1024 vertices | scaling |
-/// |---|---|---|
-/// | convex | 1.1 ms | ~n^1.3 |
-/// | comb, 512 reflex | 8.9 ms | ~n^1.9 |
-/// | random star, 512 reflex | 13 ms | ~n^2.1 |
+/// | input | 1024 vertices | 3200 vertices | scaling |
+/// |---|---|---|---|
+/// | convex | 1.2 ms (at 828) | — (coordinate cap) | ~n^1.2 |
+/// | comb, half reflex | 2.0 ms | 12 ms | ~n^1.3 rising to ~n^1.7 |
+/// | random star, half reflex | 2.9 ms | 16 ms | ~n^1.4 rising to ~n^1.6 |
 ///
-/// **Convex input is sub-quadratic**: with no reflex vertices there is no split
-/// search at all. Otherwise the search is `O(n)` per reflex vertex, so `O(n^2)`
-/// overall. The event count itself is linear.
+/// The event count is linear and each event reschedules `O(1)` vertices. The one
+/// non-constant step is the split search, `O(n)` per reflex vertex, so the worst
+/// case is `O(n^2)` — the rising exponent is that term taking over as `n` grows.
+/// **Convex input never runs it**, having no reflex vertices to search from.
 ///
-/// Beating `O(n^2)` in the worst case needs the motorcycle-graph construction of
-/// Eppstein–Erickson or Cheng–Vigneron — a different and much larger algorithm;
-/// practical implementations (CGAL, Surfer2) also ship an `O(n^2)` worst case.
-/// See `docs/ALGORITHM.md`.
+/// Beating `O(n^2)` needs the motorcycle-graph construction of Eppstein–Erickson
+/// or Cheng–Vigneron: a genuinely different algorithm, which would not obviously
+/// serve [`skeleton_constrained`] and cannot be bolted on as a pruner. CGAL and
+/// Surfer2 ship an `O(n^2)` worst case too. See `docs/ALGORITHM.md`.
+///
+/// Note that [`Polygon::new`] has its own worst-case `O(n^2)`, in the
+/// self-intersection check. It is normally far below this — 0.13 ms on the
+/// 3200-vertex comb — but a polygon whose edges all overlap in `x` defeats its
+/// pruning. See `docs/DESIGN.md`.
 ///
 /// # Examples
 ///

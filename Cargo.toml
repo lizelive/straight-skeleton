@@ -21,6 +21,7 @@ mint = { version = "0.5", optional = true }
 num-traits = { version = "0.2", default-features = false, optional = true }
 
 [dev-dependencies]
+earcutr = "0.5.0"
 serde_json = "1"
 
 [features]
@@ -56,6 +57,14 @@ required-features = ["std"]
 
 [[example]]
 name = "roof"
+required-features = ["std"]
+
+[[example]]
+name = "snapshot"
+required-features = ["std"]
+
+[[example]]
+name = "compare"
 required-features = ["std"]
 
 [package.metadata.docs.rs]
